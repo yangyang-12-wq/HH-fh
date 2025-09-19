@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import copy
 import math
 import dgl
-from graph_learners import *
+from graph_learner import *
 from layers import GCNConv_dense, GCNConv_dgl
 from torch.nn import Sequential, Linear, ReLU
 from utils import *
@@ -123,90 +123,10 @@ class GCL(nn.Module):
         node_embeddings=self.encoder(x,adj)
         graph_embedding=self.pool_fn(node_embeddings)
         logits=self.classifier(graph_embedding)
-        return logits
-    def cal_loss(self, z_specific_adjs, z_aug_adjs, z_fused_adj, sigma=None):
-        """
-        使用HSIC计算损失
-        z_specific_adjs: list of tensors, each (n_nodes, emb_dim)
-        z_aug_adjs: list of tensors, each (n_nodes, emb_dim)  (augmented)
-        z_fused_adj: tensor (n_nodes, emb_dim)  (shared fused embedding)
-        Returns: scalar loss (to minimize). We use negative HSIC (so minimization maximizes dependence).
-        """
-        device = z_fused_adj.device
-        n = z_fused_adj.size(0)
-        g = len(z_specific_adjs)
-        
-        # projections
-        z_proj_s = [self.proj_s[i](z_specific_adjs[i]) for i in range(g)]
-        z_proj_u = [self.proj_u[i](z_aug_adjs[i]) for i in range(g)]
-        z_proj_f = [self.proj_f[i](z_fused_adj) for i in range(g)]
+        return logits.squeeze(0)
+    def forward_all(self,features,adj):
+        embedding=self.forward(features,adj)
+        logits=self.forward_classify()
 
-        # L2 normalize projections (helps kernel stability)
-        z_proj_s = [F.normalize(z, dim=1, p=2) for z in z_proj_s]
-        z_proj_u = [F.normalize(z, dim=1, p=2) for z in z_proj_u]
-        z_proj_f = [F.normalize(z, dim=1, p=2) for z in z_proj_f]
-
-        # compute HSIC terms
-        # 1) specific-specific
-        loss_smi = 0.0
-        cnt = 0
-        for i in range(g):
-            for j in range(i + 1, g):
-                hs = hsic_torch(z_proj_s[i], z_proj_s[j], kernel=self.kernel_type, sigma=sigma, normalize=self.normalize_hsic)
-                loss_smi += (-hs)  # negative because we minimize
-                cnt += 1
-        if cnt > 0:
-            loss_smi = loss_smi / cnt
-        else:
-            loss_smi = torch.tensor(0., device=device)
-
-        # 2) fused vs specific
-        loss_fused = 0.0
-        for i in range(g):
-            hs = hsic_torch(z_proj_f[i], z_proj_s[i], kernel=self.kernel_type, sigma=sigma, normalize=self.normalize_hsic)
-            loss_fused += (-hs)
-        loss_fused = loss_fused / g
-
-        # 3) specific vs augmented
-        loss_umi = 0.0
-        for i in range(g):
-            hs = hsic_torch(z_proj_s[i], z_proj_u[i], kernel=self.kernel_type, sigma=sigma, normalize=self.normalize_hsic)
-            loss_umi += (-hs)
-        loss_umi = loss_umi / g
-
-        loss = loss_fused + loss_smi + loss_umi
-        return loss
-
-def AGG(h_list, adjs_o, nlayer, sparse=False):
-    f_list = []
-    for i in range(len(adjs_o)):
-        z = h_list[i]
-        adj = adjs_o[i]
-        for i in range(nlayer):
-            if sparse:
-                z = torch.sparse.mm(adj, z)
-            else:
-                z = torch.matmul(adj, z)
-        z = F.normalize(z, dim=1, p=2)
-        f_list.append(z)
-
-    return f_list
-
-def sim_con(z1, z2, temperature):
-    z1_norm = torch.norm(z1, dim=-1, keepdim=True)
-    z2_norm = torch.norm(z2, dim=-1, keepdim=True)
-    dot_numerator = torch.mm(z1, z2.t())
-    dot_denominator = torch.mm(z1_norm, z2_norm.t()) + EPS
-    sim_matrix = dot_numerator / dot_denominator / temperature
-    return sim_matrix
-
-def sce_loss(x, y, beta=1):
-    x = F.normalize(x, p=2, dim=-1)
-    y = F.normalize(y, p=2, dim=-1)
-
-    loss = (1 - (x * y).sum(dim=-1)).pow_(beta)
-
-    loss = loss.mean()
-    return loss
 
 

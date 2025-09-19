@@ -6,6 +6,8 @@ from sklearn.neighbors import kneighbors_graph
 import dgl
 from sklearn import metrics
 from munkres import Munkres
+import os
+import pickle
 
 EOS = 1e-10
 
@@ -56,7 +58,7 @@ def get_feat_mask(features, mask_rate):
     mask = torch.zeros(features.shape)
     samples = np.random.choice(feat_node, size=int(feat_node * mask_rate), replace=False)
     mask[:, samples] = 1
-    return mask.cuda()
+    return mask.to(torch.cuda.current_device() if torch.cuda.is_available() else torch.device('cpu'))
 
 
 def accuracy(preds, labels):
@@ -137,7 +139,8 @@ def cal_similarity_graph(node_embeddings):
 def top_k(raw_graph, K):
     values, indices = raw_graph.topk(k=int(K), dim=-1)
     assert torch.max(indices) < raw_graph.shape[1]
-    mask = torch.zeros(raw_graph.shape).cuda()
+    device = raw_graph.device if hasattr(raw_graph, 'device') else (torch.cuda.current_device() if torch.cuda.is_available() else torch.device('cpu'))
+    mask = torch.zeros(raw_graph.shape).to(device)
     mask[torch.arange(raw_graph.shape[0]).view(-1, 1), indices] = 1.
 
     mask.requires_grad = False
@@ -148,11 +151,12 @@ def top_k(raw_graph, K):
 def knn_fast(X, k, b):
     X = F.normalize(X, dim=1, p=2)
     index = 0
-    values = torch.zeros(X.shape[0] * (k + 1)).cuda()
-    rows = torch.zeros(X.shape[0] * (k + 1)).cuda()
-    cols = torch.zeros(X.shape[0] * (k + 1)).cuda()
-    norm_row = torch.zeros(X.shape[0]).cuda()
-    norm_col = torch.zeros(X.shape[0]).cuda()
+    device = X.device if hasattr(X, 'device') else (torch.cuda.current_device() if torch.cuda.is_available() else torch.device('cpu'))
+    values = torch.zeros(X.shape[0] * (k + 1)).to(device)
+    rows = torch.zeros(X.shape[0] * (k + 1)).to(device)
+    cols = torch.zeros(X.shape[0] * (k + 1)).to(device)
+    norm_row = torch.zeros(X.shape[0]).to(device)
+    norm_col = torch.zeros(X.shape[0]).to(device)
     while index < X.shape[0]:
         if (index + b) > (X.shape[0]):
             end = X.shape[0]
@@ -190,8 +194,9 @@ def torch_sparse_to_dgl_graph(torch_sparse_mx):
     indices = torch_sparse_mx.indices()
     values = torch_sparse_mx.values()
     rows_, cols_ = indices[0,:], indices[1,:]
-    dgl_graph = dgl.graph((rows_, cols_), num_nodes=torch_sparse_mx.shape[0], device='cuda')
-    dgl_graph.edata['w'] = values.detach().cuda()
+    device = values.device if hasattr(values, 'device') else (torch.cuda.current_device() if torch.cuda.is_available() else torch.device('cpu'))
+    dgl_graph = dgl.graph((rows_, cols_), num_nodes=torch_sparse_mx.shape[0], device=device)
+    dgl_graph.edata['w'] = values.detach().to(device)
     return dgl_graph
 
 
@@ -423,6 +428,7 @@ def hsic_torch(x, y, kernel='rbf', sigma=None, normalize=False):
     else:
         raise ValueError("Unknown kernel")
     return hsic_from_grams_torch(K, L, normalize=normalize)
+
 def symmetrize_and_normalize(A):
     if A.dim() == 2:
         A = A.unsqueeze(0)

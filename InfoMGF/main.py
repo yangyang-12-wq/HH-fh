@@ -11,17 +11,20 @@ from model import GCN, GCL, AGG
 from graph_learner import *
 from utils import *
 from params import *
-from augment import *
-from sklearn.cluster import KMeans
-from kmeans_pytorch import kmeans as KMeans_py
-from sklearn.metrics import f1_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+
 import random
+import os
+
+EOS = 1e-10
+args = set_params()
+
 
 class Experiment:
     def __init__(self):
         super(Experiment, self).__init__()
-        self.training = False
 
     def setup_seed(self, seed):
         torch.manual_seed(seed)
@@ -30,337 +33,332 @@ class Experiment:
         np.random.seed(seed)
         random.seed(seed)
 
+    def _forward_pass(self, X_batch,
+                      actual_specific_learners, actual_fused_learner, actual_model,
+                      return_for_loss=False):
 
+        intra_emb = actual_specific_learners[0](X_batch)
+        A_intra_refined = actual_specific_learners[0].graph_process(intra_emb, perform_normalization=True)
 
-    def evaluate_finetuned(self, model, fused_graph_learner, loader, args, final_test=False):
+        global_emb = actual_specific_learners[1](X_batch)
+        A_global_refined = actual_specific_learners[1].graph_process(global_emb, perform_normalization=True)
+
+        z_intra_refined = actual_model.encoder_batch(X_batch, A_intra_refined)
+        z_global_refined = actual_model.encoder_batch(X_batch, A_global_refined)
+
+        fusion_features = torch.cat([z_intra_refined, z_global_refined, X_batch], dim=-1)
+
+        fused_embedding = actual_fused_learner(fusion_features)
+        learned_fused_adj_raw = actual_fused_learner.graph_process(fused_embedding, perform_normalization=False)
+        learned_fused_adj_norm = symmetrize_and_normalize(learned_fused_adj_raw)
+
+        z_teacher_nodes, logits_batch = actual_model.forward_all_batch(X_batch, learned_fused_adj_norm)
+
+        if not return_for_loss:
+            return logits_batch
+        else:
+            # For consistency loss, we compare the final fused embedding with the refined view embeddings
+            z_specific_nodes_list = [z_intra_refined, z_global_refined]
+            # The student MLP is still used for a form of regularization
+            z_student_nodes = actual_model.forward_student_batch(X_batch)
+
+            return logits_batch, learned_fused_adj_raw, z_teacher_nodes, z_student_nodes, z_specific_nodes_list
+
+    def evaluate_finetuned(self, model, specific_learners, fused_graph_learner, loader, args, final_test=False):
         model.eval()
+        [learner.eval() for learner in specific_learners]
         fused_graph_learner.eval()
 
-        all_preds = []
-        all_labels = []
+        all_preds, all_labels = [], []
 
-        for batch in loader:
-            X_batch = batch['X'].to(self.device)
-            A_intra_batch = batch['A_intra'].to(self.device)
-            A_global_batch = batch['A_global'].to(self.device)
-            labels = batch['labels']
-        
-            batch_size = X_batch.shape[0]
+        actual_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+        actual_specific_learners = [learner.module if isinstance(learner, torch.nn.DataParallel) else learner for learner in specific_learners]
+        actual_fused_learner = fused_graph_learner.module if isinstance(fused_graph_learner, torch.nn.DataParallel) else fused_graph_learner
 
-        # 用于收集当前批次中每个样本的logits
-            logits_list = []
-        
-        # 循环处理批次中的每个样本
-            for i in range(batch_size):
+        device = next(model.parameters()).device
 
-                features = X_batch[i]
-                adjs = [A_intra_batch[i], A_global_batch[i]]
+        with torch.no_grad():
+            for batch in loader:
+                X_batch = batch['X'].to(device)
+                labels = batch['labels']
 
-                adjs_norm = [symmetrize_and_normalize(adj.unsqueeze(0)).squeeze(0) for adj in adjs]
-                view_features = AGG([features for _ in adjs_norm], adjs_norm, args.r)
-                view_features.append(features)
-            
-                fused_embedding_nodes = fused_graph_learner(torch.cat(view_features, dim=1))
-                learned_fused_adj = fused_graph_learner.graph_process(fused_embedding_nodes)
-                learned_fused_adj = graph_to_dense_if_needed(learned_fused_adj, self.device)
-                learned_fused_adj = symmetrize_and_normalize(learned_fused_adj.unsqueeze(0)).squeeze(0)
-            
-        
-                logits_sample = model.forward_classify(features, learned_fused_adj)
-                logits_list.append(logits_sample)
-            logits_batch = torch.stack(logits_list)
-            preds = torch.argmax(logits_batch, dim=1).cpu()
+                logits_batch = self._forward_pass(
+                    X_batch,
+                    actual_specific_learners, actual_fused_learner, actual_model,
+                    return_for_loss=False
+                )
 
-            all_preds.extend(preds.numpy())
-            all_labels.extend(labels.numpy())
-        
-    # 使用sklearn的函数计算准确率和F1分数
+                preds = torch.argmax(logits_batch, dim=1).cpu()
+                all_preds.extend(preds.numpy())
+                all_labels.extend(labels.numpy())
+
         acc = accuracy_score(all_labels, all_preds)
         f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+
         if final_test:
             precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
             recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
             return acc, f1, precision, recall
         else:
             return acc, f1
-    def loss_discriminator(self, discriminator, model, specific_graph_learner, features, view_features, adjs, optimizer_discriminator):
-
-        optimizer_discriminator.zero_grad()
-
-        learned_specific_adjs = []
-        for i in range(len(adjs)):
-            specific_adjs_embedding = specific_graph_learner[i](view_features[i])
-            learned_specific_adj = specific_graph_learner[i].graph_process(specific_adjs_embedding)
-            learned_specific_adjs.append(learned_specific_adj)
-
-        z_specific_adjs = [model(features, learned_specific_adjs[i]) for i in range(len(adjs))]
-
-        adjs_aug = graph_generative_augment(adjs, features, discriminator, sparse=args.sparse)
-        z_aug_adjs = [model(features, adjs_aug[i]) for i in range(len(adjs))]
-        loss_dis = discriminator.cal_loss_dis(z_aug_adjs, z_specific_adjs, view_features)
-
-        loss_dis.backward()
-        optimizer_discriminator.step()
-        return loss_dis
-
-    def loss_gcl(self, model, specific_graph_learner, fused_graph_learner, features, view_features, adjs,
-                 optimizer, discriminator=None):
-        optimizer.zero_grad()
-
-        learned_specific_adjs = []
-        for i in range(len(adjs)):
-            specific_adjs_embedding = specific_graph_learner[i](view_features[i])
-            learned_specific_adj = specific_graph_learner[i].graph_process(specific_adjs_embedding)
-            learned_specific_adjs.append(learned_specific_adj)
-
-        fused_embedding = fused_graph_learner(torch.cat(view_features, dim=1))
-        learned_fused_adj = fused_graph_learner.graph_process(fused_embedding)
-        z_specific_adjs = [model(features, learned_specific_adjs[i]) for i in range(len(adjs))]
-        z_fused_adj = model(features, learned_fused_adj)
-
-        if args.augment_type == 'random':
-            adjs_aug = graph_augment(adjs, args.dropedge_rate, training=self.training, sparse=args.sparse)
-        elif args.augment_type == 'generative':
-            adjs_aug = graph_generative_augment(adjs, features, discriminator, sparse=args.sparse)
-        if args.sparse:
-            for i in range(len(adjs)):
-                adjs_aug[i].edata['w'] = adjs_aug[i].edata['w'].detach()
-        else:
-            adjs_aug = [a.detach() for a in adjs_aug]
-        z_aug_adjs = [model(features, adjs_aug[i]) for i in range(len(adjs))]
 
 
-        if args.contrast_batch_size:
-            node_idxs = list(range(features.shape[0]))
-            random.shuffle(node_idxs)
-            batches = split_batch(node_idxs, args.contrast_batch_size)
-            loss = 0
-            for batch in batches:
-                weight = len(batch) / features.shape[0]
-                loss += model.cal_loss([z[batch] for z in z_specific_adjs], [z[batch] for z in z_aug_adjs], z_fused_adj[batch]) * weight
-        else:
-            loss = model.cal_loss(z_specific_adjs, z_aug_adjs, z_fused_adj)
+    def _calculate_dirichlet_energy_loss_robust(self, z_batch, adj_raw_batch):
+        B, N, feat_dim = z_batch.shape
+        eye = torch.eye(N, device=adj_raw_batch.device).unsqueeze(0)
+        adj_clean = adj_raw_batch * (1 - eye)
+        degrees = torch.sum(adj_clean, dim=-1)
+        D_inv_sqrt = torch.diag_embed(1.0 / (torch.sqrt(degrees) + EOS))
+        L_sym = eye - torch.bmm(torch.bmm(D_inv_sqrt, adj_clean), D_inv_sqrt)
 
-        loss.backward()
-        optimizer.step()
+        loss_matrix = torch.bmm(z_batch.transpose(1, 2), torch.bmm(L_sym, z_batch)) 
+        dirichlet_energy = torch.einsum('bii->b', loss_matrix) 
 
-        return loss
+        normalized_energy = dirichlet_energy / (N * feat_dim)
+
+        return normalized_energy.mean()
+
+    def _calculate_smoothness_loss_batch_robust(self, adj_raw_batch, features_batch):
+
+        B, N, feat_dim = features_batch.shape
+
+        eye = torch.eye(N, device=adj_raw_batch.device).unsqueeze(0)
+        adj_clean = adj_raw_batch * (1 - eye)
+
+        degrees = torch.sum(adj_clean, dim=-1)
+
+        D_inv_sqrt = torch.diag_embed(1.0 / (torch.sqrt(degrees) + EOS))
+
+        L_sym = eye - torch.bmm(torch.bmm(D_inv_sqrt, adj_clean), D_inv_sqrt)
+
+        loss_matrix = torch.bmm(features_batch.transpose(1, 2), torch.bmm(L_sym, features_batch))
+        smoothness = torch.einsum('bii->b', loss_matrix) # shape: (B,)
+
+        normalized_smoothness = smoothness / (N * feat_dim)
+
+        return normalized_smoothness.mean()
+
+    def _calculate_consistency_loss_batch_robust(self, z_fused_batch, z_specific_list_batch, alpha: float = 0.1):
+        mse_loss = 0.0
+        for z_specific in z_specific_list_batch:
+            mse_loss += F.mse_loss(z_fused_batch, z_specific)
+
+        cohesion_loss = mse_loss / len(z_specific_list_batch)
+
+        B, N, feat_dim = z_fused_batch.shape
+        z_norm = z_fused_batch - z_fused_batch.mean(dim=1, keepdim=True)
+        cov_matrix = torch.bmm(z_norm.transpose(1, 2), z_norm) / (N - 1 + 1e-6) # (B, feat_dim, feat_dim)
+        off_diagonal_elements = cov_matrix * (1 - torch.eye(feat_dim, device=z_fused_batch.device).unsqueeze(0))
+        separation_loss = torch.mean(off_diagonal_elements**2) # encourage off-diagonals to 0
+
+        return cohesion_loss + alpha * separation_loss
 
     def train(self, args):
-        print(args)
-        device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
+        # Minimal console output by default; enable verbose with args.debug
+        device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() and args.gpu is not None else "cpu")
+        self.device = device
         self.setup_seed(args.seed)
 
         datamodule = RestingDataModule(
-          processed_dir=args.out_dir,
-          feature_path=args.feature_path,
-          batch_size=args.batch_size,
-          use_npy=True,
-          preload=args.preload,
-          num_workers=args.num_workers
+            processed_dir=args.out_dir, feature_path=args.feature_path,
+            batch_size=args.batch_size, use_npy=False, preload=args.preload,
+            num_workers=args.num_workers
         )
         datamodule.setup()
-        train_loader = datamodule.train_dataloader()
-        val_loader = datamodule.val_dataloader()
-        test_loader = datamodule.test_dataloader()
+        train_loader, val_loader, test_loader = datamodule.train_dataloader(), datamodule.val_dataloader(), datamodule.test_dataloader()
 
         sample0 = datamodule.trainset[0]
         nfeats = sample0['X'].shape[1]
         nclasses = len(set([d['label'].item() for d in datamodule.trainset]))
-        print(f"Data loaded via DataLoader. Node feature dim: {nfeats}, Num classes: {nclasses}")
+
+        num_views = 2
+        gnn_emb_dim = args.rep_dim 
+        specific_learner_isize = nfeats
+        specific_graph_learner = [ATT_learner(2, specific_learner_isize, args.k, 6, args.dropedge_rate, args.activation_learner, emb_dim=32, temperature=args.temperature) for _ in range(num_views)]
+
+
+        fused_learner_isize = gnn_emb_dim * num_views + nfeats
+        fused_graph_learner = ATT_learner(2, fused_learner_isize, args.k, 6, args.dropedge_rate, args.activation_learner, emb_dim=32, temperature=args.temperature)
         
-        num_views = 2 # intra, global
-        specific_graph_learner = [ATT_learner(2, nfeats, args.k, 6, args.dropedge_rate, args.sparse, args.activation_learner) for _ in range(num_views)]
-        fused_graph_learner = ATT_learner(2, nfeats * (num_views + 1), args.k, 6, args.dropedge_rate, args.sparse, args.activation_learner)
         model = GCL(
             nlayers=args.nlayers, in_dim=nfeats, hidden_dim=args.hidden_dim,
-            emb_dim=args.rep_dim, proj_dim=args.proj_dim,
-            dropout=args.dropout, sparse=args.sparse, num_g=num_views,
-            num_classes=nclasses
+            emb_dim=gnn_emb_dim, dropout=args.dropout, num_classes=nclasses
         )
+        
         model.to(device)
         specific_graph_learner = [m.to(device) for m in specific_graph_learner]
         fused_graph_learner.to(device)
-        params_pretrain = [{'params': l.parameters()} for l in specific_graph_learner] + \
-        [{'params': fused_graph_learner.parameters()}, {'params': model.parameters()}]
-        optimizer_pretrain = torch.optim.Adam(params_pretrain, lr=args.lr, weight_decay=args.w_decay)
-        optimizer_finetune = torch.optim.Adam(model.parameters(), lr=args.lr_finetune, weight_decay=args.w_decay) 
-        if args.augment_type == 'generative':
-            print("Using Generative Augmentation.")
-            discriminator = Discriminator(
-                input_dim=nfeats, 
-                hidden_dim=args.hidden_dim, # 可以复用或设置新参数
-                rep_dim=args.rep_dim, 
-                aug_lambda=args.aug_lambda # 需要新增此参数
-            ).to(device)
-            optimizer_discriminator = torch.optim.Adam(
-                discriminator.parameters(), 
-                lr=args.lr_dis, # 需要新增此参数
-                weight_decay=args.w_decay
-            )
-        else:
-            print("Using Random Augmentation.")
-            discriminator = None
-            optimizer_discriminator = None
-        optimizer_pretrain = torch.optim.Adam(params_pretrain, lr=args.lr, weight_decay=args.w_decay)
+        
+        # Multi-GPU support (simple DataParallel)
+        if args.multi_gpu and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            model = torch.nn.DataParallel(model)
+            specific_graph_learner = [torch.nn.DataParallel(m) for m in specific_graph_learner]
+            fused_graph_learner = torch.nn.DataParallel(fused_graph_learner)
 
-        optimizer_finetune = torch.optim.Adam(model.parameters(), lr=args.lr_finetune, weight_decay=args.w_decay)
-        print("\n--- STAGE 1: Self-supervised Pre-training ---")
-        for epoch in range(1, args.pretrain_epochs + 1):
+        # optimizer param groups
+        all_params = []
+        for m in specific_graph_learner:
+            all_params.append({'params': m.parameters()})
+        all_params.append({'params': fused_graph_learner.parameters()})
+        all_params.append({'params': model.parameters()})
+
+        optimizer = torch.optim.Adam(all_params, lr=args.lr, weight_decay=args.w_decay)
+
+        # Optional mixed precision
+        use_amp = getattr(args, 'use_amp', False)
+        scaler = torch.cuda.amp.GradScaler() if use_amp else None
+
+        # LR scheduler and early stopping
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10, verbose=False)
+        patience = getattr(args, 'early_stop_patience', 30)
+        min_epochs = args.min_training_epochs
+
+        writer = SummaryWriter(log_dir=f'runs/{args.dataset_name}_Improved_{datetime.now().strftime("%Y-%m-%d_%H-%M")}')
+        best_val_f1 = -1.0
+        epochs_no_improve = 0
+
+        actual_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+        actual_specific_learners = [learner.module if isinstance(learner, torch.nn.DataParallel) else learner for learner in specific_graph_learner]
+        actual_fused_learner = fused_graph_learner.module if isinstance(fused_graph_learner, torch.nn.DataParallel) else fused_graph_learner
+
+        for epoch in range(1, args.epochs + 1):
             model.train()
             [learner.train() for learner in specific_graph_learner]
             fused_graph_learner.train()
-            if discriminator:
-                discriminator.eval()
-            epoch_loss = 0.0
-            pbar = tqdm(train_loader, desc=f"Pre-train Epoch {epoch}[GCL]")
+
+            epoch_losses = {'ce': 0.0, 'smooth': 0.0, 'consistency': 0.0, 'lfd': 0.0, 'sparsity': 0.0}
+            total_batches = len(train_loader)
+
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
 
             for batch in pbar:
-                X_batch, A_intra_batch, A_global_batch = batch['X'].to(device), batch['A_intra'].to(device), batch['A_global'].to(device)
-                batch_size = X_batch.shape[0]
-            
-                # 对Batch中的每个样本独立计算GCL损失
-                total_batch_loss = 0
-                for i in range(batch_size):
-                    features = X_batch[i]
-                    adjs = [A_intra_batch[i], A_global_batch[i]]
-                    adjs_norm = [symmetrize_and_normalize(adj.unsqueeze(0)).squeeze(0) for adj in adjs] # 需要symmetrize_and_normalize函数
-                
-                    view_features = AGG([features for _ in adjs_norm], adjs_norm, args.r)
-                    view_features.append(features)
-                
-                # loss_gcl的逻辑现在逐样本执行
-                    learned_specific_adjs = [specific_graph_learner[j].graph_process(specific_graph_learner[j](view_features[j])) for j in range(num_views)]
-                    fused_embedding = fused_graph_learner(torch.cat(view_features, dim=1))
-                    learned_fused_adj = fused_graph_learner.graph_process(fused_embedding)
+                X_batch = batch['X'].to(device)
+                labels_batch = batch['labels'].to(device)
 
-                    z_specific = [model(features, learned_specific_adjs[j]) for j in range(num_views)]
-                    z_fused = model(features, learned_fused_adj)
-                    if args.augment_type == 'generative':
-                        adjs_aug = graph_generative_augment(adjs, features, discriminator, sparse=args.sparse)
-                        adjs_aug = [aug.detach() for aug in adjs_aug]
-                    else:
-                       adjs_aug = [graph_augment(adj, args.dropedge_rate) for adj in adjs]
-                    z_aug = [model(features, adjs_aug[j]) for j in range(num_views)]
-                
-                    loss_sample = model.cal_loss(z_specific, z_aug, z_fused)
-                    total_batch_loss += loss_sample
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        logits_batch, learned_fused_adj_raw, z_teacher_nodes, z_student_nodes, z_specific_nodes_list = self._forward_pass(
+                            X_batch, actual_specific_learners, actual_fused_learner, actual_model, return_for_loss=True)
 
-                if batch_size > 0:
-                    optimizer_pretrain.zero_grad()
-                    avg_batch_loss = total_batch_loss / batch_size
-                    avg_batch_loss.backward()
-                    optimizer_pretrain.step()
-                    epoch_loss += avg_batch_loss.item()
-                    pbar.set_postfix(cl_loss=avg_batch_loss.item())
-            if args.augment_type=='generative':
-                model.eval()
-                [learner.eval() for learner in specific_graph_learner]
-                fused_graph_learner.eval()
-                discriminator.train()
-                epoch_dis_loss = 0.0
-                pbar_dis = tqdm(train_loader, desc=f"Pre-train Epoch {epoch}[Discriminator]")
-                for batch in pbar_dis:
-                    X_batch, A_intra_batch, A_global_batch = batch['X'].to(device), batch['A_intra'].to(device), batch['A_global'].to(device)
-                    batch_size = X_batch.shape[0]
-                
-                    total_dis_loss = 0
-                    for i in range(batch_size):
-                        features = X_batch[i]
-                        adjs = [A_intra_batch[i], A_global_batch[i]]
-                        while torch.no_grad():
-                            adjs_norm = [symmetrize_and_normalize(adj.unsqueeze(0)).squeeze(0) for adj in adjs]
-                            view_features = AGG([features for _ in adjs_norm], adjs_norm, args.r)
-                            view_features.append(features)
-                            learned_specific_adjs = [specific_graph_learner[j].graph_process(specific_graph_learner[j](view_features[j])) for j in range(num_views)]
-                            z_specific = [model(features, learned_specific_adjs[j]) for j in range(num_views)]
-                        adjs_aug_edges=adjs[0].to_sparse().coalesce().indices()
-                        adjs_aug_weights=discriminator(features, adjs_aug_edges)
-                        adjs_aug = [torch.sparse.FloatTensor(adjs_aug_edges, adjs_aug_weights.detach(), adjs[j].shape) for j in range(num_views)]
-                        z_aug = [model(features, adjs_aug[j]) for j in range(num_views)]
-                        loss_dis_sample=discriminator.cal_loss_dis(adjs_aug=a.to_dense() for a in adjs_aug, adjs_original=[graph_to_dense_if_needed(a,device) for a in learned_specific_adjs],
-                         view_features=[features],
-                         node_reps_aug=z_aug,
-                         node_reps_orig=z_specific
-                        )
-                        total_dis_loss+=loss_dis_sample
-                    if batch_size>0:
-                        optimizer_discriminator.zero_grad()
-                        avg_batch_dis_loss = total_dis_loss / batch_size
-                        avg_batch_dis_loss.backward()
-                        optimizer_discriminator.step()
-                        epoch_dis_loss += avg_batch_dis_loss.item()
-                        pbar_dis.set_postfix(dis_loss=avg_batch_dis_loss.item())
-        avg_epoch_cl_loss = epoch_loss / len(train_loader)
-        print_str = f"Pre-train Epoch {epoch} | Avg CL Loss: {avg_epoch_cl_loss:.4f}"
-        if args.augment_type == 'generative':
-            avg_epoch_dis_loss = epoch_dis_loss / len(train_loader)
-            print_str += f" | Avg DIS Loss: {avg_epoch_dis_loss:.4f}"
-        print(print_str)
-        
-        print("Pre-training Finished")
-        print("\n--- STAGE 2: Supervised Fine-tuning ---")
-        best_val_f1 = 0
-        patience_counter = 0
+                        ce_loss = F.cross_entropy(logits_batch, labels_batch)
+                        smooth_loss = self._calculate_smoothness_loss_batch_robust(learned_fused_adj_raw, X_batch)
+                        consistency_loss = self._calculate_consistency_loss_batch_robust(z_teacher_nodes, z_specific_nodes_list)
+                        lfd_loss = self._calculate_dirichlet_energy_loss_robust(z_teacher_nodes, learned_fused_adj_raw)
+                        sparsity_loss = torch.mean(torch.abs(learned_fused_adj_raw))
 
-        for epoch in range(1, args.finetune_epochs + 1):
-            model.train()
-            fused_graph_learner.train() # 图学习器也参与微调
+                        total_loss = args.classification_weight * ce_loss + \
+                                     args.lambda_smooth * smooth_loss + \
+                                     args.lambda_consistency * consistency_loss + \
+                                     args.lambda_lfd * lfd_loss + \
+                                     getattr(args, 'lambda_sparsity', 0.0) * sparsity_loss
 
-            pbar = tqdm(train_loader, desc=f"Finetune Epoch {epoch}")
-            for batch in pbar:
-                X_batch, A_intra_batch, A_global_batch, labels_batch = batch['X'].to(device), batch['A_intra'].to(device), batch['A_global'].to(device), batch['labels'].to(device)
-                batch_size = X_batch.shape[0]
-            
-                logits_list = []
-                for i in range(batch_size):
-                    features, adjs = X_batch[i], [A_intra_batch[i], A_global_batch[i]]
-                    adjs_norm = [symmetrize_and_normalize(adj.unsqueeze(0)).squeeze(0) for adj in adjs]
-                    view_features = AGG([features for _ in adjs_norm], adjs_norm, args.r)
-                    view_features.append(features)
-                
-                    fused_embedding_nodes = fused_graph_learner(torch.cat(view_features, dim=1))
-                    learned_fused_adj = fused_graph_learner.graph_process(fused_embedding_nodes)
-                    learned_fused_adj = graph_to_dense_if_needed(learned_fused_adj, device) # 需要graph_to_dense_if_needed函数
-                    learned_fused_adj = symmetrize_and_normalize(learned_fused_adj.unsqueeze(0)).squeeze(0)
+                    optimizer.zero_grad()
+                    scaler.scale(total_loss).backward()
+                    if getattr(args, 'grad_clip', 0.0) > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
 
-                    logits_sample = model.forward_classify(features, learned_fused_adj)
-                    logits_list.append(logits_sample)
+                else:
+                    logits_batch, learned_fused_adj_raw, z_teacher_nodes, z_student_nodes, z_specific_nodes_list = self._forward_pass(
+                        X_batch, actual_specific_learners, actual_fused_learner, actual_model, return_for_loss=True)
 
-                logits_batch = torch.stack(logits_list)
-                loss_ce_batch = F.cross_entropy(logits_batch, labels_batch)
+                    ce_loss = F.cross_entropy(logits_batch, labels_batch)
+                    smooth_loss = self._calculate_smoothness_loss_batch_robust(learned_fused_adj_raw, X_batch)
+                    consistency_loss = self._calculate_consistency_loss_batch_robust(z_teacher_nodes, z_specific_nodes_list)
+                    lfd_loss = self._calculate_dirichlet_energy_loss_robust(z_teacher_nodes, learned_fused_adj_raw)
+                    sparsity_loss = torch.mean(torch.abs(learned_fused_adj_raw))
 
-                optimizer_finetune.zero_grad()
-                loss_ce_batch.backward()
-                optimizer_finetune.step()
-                pbar.set_postfix(ce_loss=loss_ce_batch.item())
+                    total_loss = args.classification_weight * ce_loss + \
+                                 args.lambda_smooth * smooth_loss + \
+                                 args.lambda_consistency * consistency_loss + \
+                                 args.lambda_lfd * lfd_loss + \
+                                 getattr(args, 'lambda_sparsity', 0.0) * sparsity_loss
 
-        # [修改] 6. 评估微调后的模型
-            val_acc, val_f1 = self.evaluate_finetuned(model, fused_graph_learner, val_loader, args)
-            print(f"Finetune Epoch {epoch} | Val F1: {val_f1:.4f} | Val Acc: {val_acc:.4f}")
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    if getattr(args, 'grad_clip', 0.0) > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    optimizer.step()
 
+                # accumulate
+                epoch_losses['ce'] += ce_loss.item()
+                epoch_losses['smooth'] += smooth_loss.item()
+                epoch_losses['consistency'] += consistency_loss.item()
+                epoch_losses['lfd'] += lfd_loss.item()
+                epoch_losses['sparsity'] += sparsity_loss.item()
+
+                # update progress bar
+                pbar.set_postfix({
+                    'tot_loss': f"{total_loss.item():.4f}",
+                    'ce': f"{ce_loss.item():.4f}",
+                    'f1_best': f"{best_val_f1:.4f}"
+                })
+
+            # average epoch losses
+            for k in epoch_losses:
+                epoch_losses[k] /= max(1, total_batches)
+
+            # Validation
+            val_acc, val_f1 = self.evaluate_finetuned(model, specific_graph_learner, fused_graph_learner, val_loader, args)
+
+            # Scheduler step (monitor val_f1)
+            scheduler.step(val_f1)
+
+            # Logging
+            writer.add_scalar('Loss/ce', epoch_losses['ce'], epoch)
+            writer.add_scalar('Loss/smooth', epoch_losses['smooth'], epoch)
+            writer.add_scalar('Loss/consistency', epoch_losses['consistency'], epoch)
+            writer.add_scalar('Loss/lfd', epoch_losses['lfd'], epoch)
+            writer.add_scalar('Loss/sparsity', epoch_losses['sparsity'], epoch)
+            writer.add_scalar('Metrics/val_f1', val_f1, epoch)
+            writer.add_scalar('Metrics/val_acc', val_acc, epoch)
+
+            # concise console output
+            if getattr(args, 'debug', False):
+                print(f"Epoch {epoch} | ce: {epoch_losses['ce']:.4f} | smooth: {epoch_losses['smooth']:.6f} | consist: {epoch_losses['consistency']:.5f} | lfd: {epoch_losses['lfd']:.6f} | val_f1: {val_f1:.4f}")
+            else:
+                print(f"Epoch {epoch} | val_f1: {val_f1:.4f} | val_acc: {val_acc:.4f}")
+
+            # checkpointing and early stopping
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
-                patience_counter = 0
-                torch.save(model.state_dict(), args.model_save_path)
-                print(f"Saved best model to {args.model_save_path}")
+                epochs_no_improve = 0
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'specific_learners_state_dict': [learner.state_dict() for learner in specific_graph_learner],
+                    'fused_learner_state_dict': fused_graph_learner.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_val_f1': best_val_f1,
+                }, args.model_save_path)
             else:
-                patience_counter += 1
-                if patience_counter >= args.patience:
-                    print("Early stopping triggered.")
-                    break
+                epochs_no_improve += 1
 
-    # [修改] 7. 最终测试
-        print(f"\nLoading best model from {args.model_save_path} for final testing...")
+            if epoch >= min_epochs and epochs_no_improve >= patience:
+                print(f"Early stopping triggered at epoch {epoch}. No improvement in val_f1 for {patience} epochs.")
+                break
+
+        # training end
+        # load best model for final test
         if os.path.exists(args.model_save_path):
-            model.load_state_dict(torch.load(args.model_save_path))
-            test_acc, test_f1, _, _ = self.evaluate_finetuned(model, fused_graph_learner, test_loader, args, final_test=True)
-            print("-" * 50)
-            print(f"Final Test Accuracy: {test_acc:.4f}")
-            print(f"Final Test F1-Macro: {test_f1:.4f}")
-            print("-" * 50)
+            ckpt = torch.load(args.model_save_path, map_location=device)
+            model.load_state_dict(ckpt['model_state_dict'])
+            for sl, sd in zip(specific_graph_learner, ckpt['specific_learners_state_dict']):
+                sl.load_state_dict(sd)
+            fused_graph_learner.load_state_dict(ckpt['fused_learner_state_dict'])
+
+        # final evaluation
+        final_metrics = self.evaluate_finetuned(model, specific_graph_learner, fused_graph_learner, test_loader, args, final_test=True)
+        if getattr(args, 'verbose_final', True):
+            acc, f1, precision, recall = final_metrics
+            print("Final Test Results | ", f"Acc: {acc:.4f} | F1: {f1:.4f} | Prec: {precision:.4f} | Rec: {recall:.4f}")
+
+        writer.close()
+        return final_metrics
+
 
 if __name__ == '__main__':
-
-        experiment = Experiment()
-        experiment.train(args)
+    experiment = Experiment()
+    experiment.train(args)

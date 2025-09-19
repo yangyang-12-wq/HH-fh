@@ -46,7 +46,8 @@ class ATT_learner(nn.Module):
             values_ = torch.cat((values, values))
             values_ = apply_non_linearity(values_, self.non_linearity, self.i)
             values_ = F.dropout(values_, p=self.dropedge_rate, training=self.training)
-            learned_adj = dgl.graph((rows_, cols_), num_nodes=embeddings.shape[0], device='cuda')
+            device = embeddings.device if hasattr(embeddings, 'device') else (torch.cuda.current_device() if torch.cuda.is_available() else torch.device('cpu'))
+            learned_adj = dgl.graph((rows_, cols_), num_nodes=embeddings.shape[0], device=device)
             learned_adj.edata['w'] = values_
             return learned_adj
         else:
