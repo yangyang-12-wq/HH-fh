@@ -462,3 +462,68 @@ def graph_to_dense_if_needed(g, device):
     if isinstance(g, np.ndarray):
         return torch.from_numpy(g).float().to(device)
     return g.to(device)
+def edge_index_to_sparse_coo(edge_index, num_nodes, device=None, dtype=torch.float32):
+    device = device if device is not None else edge_index.device
+    rows = edge_index[0].to(device)
+    cols = edge_index[1].to(device)
+    vals = torch.ones(rows.size(0), dtype=dtype, device=device)
+    idx = torch.stack([rows, cols], dim=0)
+    return torch.sparse_coo_tensor(idx, vals, (num_nodes, num_nodes), device=device, dtype=dtype).coalesce()
+
+def build_adjs_from_batch(batch, device):
+    """
+    从 PyG Batch 生成每个视图的 sparse_coo_tensor 或空矩阵列表
+    返回：adjs_list（list），node2graph(batch.batch)，N_total
+    """
+    N = batch.x.shape[0]
+    adjs = []
+    if hasattr(batch, 'edge_index_intra') and hasattr(batch, 'edge_index_global'):
+        adjs.append(edge_index_to_sparse_coo(batch.edge_index_intra, N, device=device))
+        adjs.append(edge_index_to_sparse_coo(batch.edge_index_global, N, device=device))
+    elif hasattr(batch, 'edge_index'):
+        adjs.append(edge_index_to_sparse_coo(batch.edge_index, N, device=device))
+    else:
+        adjs.append(torch.sparse_coo_tensor(torch.empty((2,0), dtype=torch.long, device=device),
+                                           torch.empty((0,), device=device),
+                                           (N, N), device=device).coalesce())
+    return adjs, batch.batch.to(device), N
+def adj_to_sparse_coo(adj, num_nodes, device):
+
+    if adj is None:
+        return torch.sparse_coo_tensor(torch.empty((2,0), dtype=torch.long, device=device),
+                                       torch.empty((0,), device=device),
+                                       (num_nodes, num_nodes), device=device).coalesce()
+
+    if hasattr(adj, 'is_homogeneous') and isinstance(adj, dgl.DGLGraph):
+        g = adj
+        # get edges (u, v)
+        u, v = g.edges(order='eid')
+        u = u.to(device); v = v.to(device)
+        if 'w' in g.edata:
+            vals = g.edata['w'].to(device)
+        else:
+            vals = torch.ones(u.size(0), device=device)
+        idx = torch.stack([u, v], dim=0)
+        return torch.sparse_coo_tensor(idx, vals, (num_nodes, num_nodes), device=device).coalesce()
+    if isinstance(adj, torch.Tensor) and adj.is_sparse:
+        return adj.coalesce().to(device)
+
+    if isinstance(adj, (list, tuple)) and len(adj) >= 2:
+        idx = torch.stack([adj[0].to(device), adj[1].to(device)], dim=0)
+        vals = torch.ones(idx.shape[1], device=device)
+        return torch.sparse_coo_tensor(idx, vals, (num_nodes, num_nodes), device=device).coalesce()
+
+    if isinstance(adj, torch.Tensor):
+        A = adj.to(device)
+        rows, cols = torch.where(A > 0)
+        if rows.numel() == 0:
+            return torch.sparse_coo_tensor(torch.empty((2,0), dtype=torch.long, device=device),
+                                           torch.empty((0,), device=device),
+                                           (num_nodes, num_nodes), device=device).coalesce()
+        idx = torch.stack([rows, cols], dim=0)
+        vals = A[rows, cols].to(device)
+        return torch.sparse_coo_tensor(idx, vals, (num_nodes, num_nodes), device=device).coalesce()
+
+    return torch.sparse_coo_tensor(torch.empty((2,0), dtype=torch.long, device=device),
+                                   torch.empty((0,), device=device),
+                                   (num_nodes, num_nodes), device=device).coalesce()

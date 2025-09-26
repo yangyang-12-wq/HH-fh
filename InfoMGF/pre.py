@@ -18,7 +18,6 @@ from utils_graph_build import (
 )
 from node_extractor import *
 
-
 def process_split(split_name, rows, out_dir, feature_path, region_map, global_edges, node_extractor,
                   k_intra, k_global, w1, w2, fs, device, batch_size, save_npy):
     out = {}
@@ -33,7 +32,6 @@ def process_split(split_name, rows, out_dir, feature_path, region_map, global_ed
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
 
-        # 找到当前批次中最长的样本长度
         max_T = max(entry['data'].shape[0] for entry in batch)
         C = batch[0]['data'].shape[1]
 
@@ -45,11 +43,9 @@ def process_split(split_name, rows, out_dir, feature_path, region_map, global_ed
 
         padded_ts = padded_ts.to(device)
 
-        # node features extraction (GPU accelerated)
         with torch.no_grad():
             feats_batch = node_extractor(padded_ts)  # [B, C, d]
 
-        # 将GPU计算结果取回CPU，然后逐个样本进行图构建
         feats_batch_np = feats_batch.cpu().numpy()
 
         for j, entry in enumerate(batch):

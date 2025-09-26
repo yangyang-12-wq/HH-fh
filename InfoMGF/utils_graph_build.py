@@ -38,7 +38,6 @@ def compute_global_edges(train_dataset, n_bins=16, strategy="uniform"):
         edges_list.append(edges)
     return edges_list
 
-#为了使用互信息而创建的分箱函数
 def discretize_data_strict(data, n_bins=16, strategy="uniform", eps=1e-8,
                            global_edges=None):
     T, C = data.shape

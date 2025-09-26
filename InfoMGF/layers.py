@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 
 EOS = 1e-10
-
+#然后刚才的精炼图再经过这个GCN就可以成为老师节点了 放到蒸馏损失里面
 class GCNConv_dense(nn.Module):
     def __init__(self, input_size, output_size):
         super(GCNConv_dense, self).__init__()
