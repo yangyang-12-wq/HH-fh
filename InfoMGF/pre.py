@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
+import random
 from utils_graph_build import (
     make_region_map,
     compute_global_edges,
@@ -17,7 +18,139 @@ from utils_graph_build import (
     brain_regions
 )
 from node_extractor import *
+class DataAugmentor:
+    @staticmethod
+    def time_shifting(data):
+        # 时间平移
+        shift = random.randint(-200, 200)
+        if isinstance(data, torch.Tensor):
+            return torch.roll(data, shifts=shift, dims=0)
+        else:  # numpy array
+            return np.roll(data, shift=shift, axis=0)
+    @staticmethod
+    def time_reversal(data):
+        # 时间反转
+        if isinstance(data, torch.Tensor):
+            return torch.flip(data, dims=[0])
+        else:  # numpy array
+            return np.flip(data, axis=0)
 
+    @staticmethod
+    def noise_injection(data):
+        # 噪声注入
+        if isinstance(data, torch.Tensor):
+            noise = torch.randn_like(data) * 0.02
+            return data + noise
+        else:  # numpy array
+            noise = np.random.normal(0, 0.02, data.shape)
+            return data + noise
+        
+    @staticmethod
+    def time_masking(data):
+        data_copy = data.copy() if isinstance(data, np.ndarray) else data.clone()
+        mask_len = random.randint(50, 300)
+        if isinstance(data_copy, torch.Tensor):
+            mask_start = random.randint(0, data_copy.size(0) - mask_len)
+            data_copy[mask_start:mask_start + mask_len] = 0
+        else:  # numpy array
+            mask_start = random.randint(0, data_copy.shape[0] - mask_len)
+            data_copy[mask_start:mask_start + mask_len] = 0
+            
+        return data_copy
+
+    @staticmethod
+    def augment_data(data):
+        """随机选择一种增强方法"""
+        augmentation_methods = [
+            lambda x: x,  # 不增强
+            DataAugmentor.time_shifting,
+            DataAugmentor.noise_injection,
+            DataAugmentor.time_masking,
+            DataAugmentor.time_reversal
+        ]
+        method = random.choice(augmentation_methods)
+        return method(data)
+def oversample_training_data(rows, augment_minority=True):
+    """
+    对训练集进行过采样
+    """
+    # 先处理成二分类（根据师兄的逻辑）
+    processed_rows = []
+    for row in rows:
+        label = row['labels']
+        if label in [0, 1, 2, 3, 4]:  # 过滤有效标签
+            # 二分类：0 vs 1-4 -> 1
+            binary_label = 0 if label == 0 else 1
+            processed_rows.append({
+                'id': row['id'],
+                'data': row['data'],
+                'labels': binary_label
+            })
+    
+    rows = processed_rows
+    
+    # 计算类别分布
+    label_counts = Counter([r['labels'] for r in rows])
+    max_count = max(label_counts.values())
+    
+    print(f"原始类别分布: {dict(label_counts)}")
+    
+    augmented_data = rows.copy()
+    
+    # 对少数类进行过采样
+    for label, count in label_counts.items():
+        if count < max_count:
+            minority_samples = [r for r in rows if r['labels'] == label]
+            needed = max_count - count
+            
+            for i in range(needed):
+                # 随机选择一个少数类样本
+                sample = random.choice(minority_samples).copy()
+                
+                # 应用数据增强
+                if augment_minority:
+                    sample['data'] = DataAugmentor.augment_data(sample['data'])
+                    sample['id'] = f"{sample['id']}_aug_{i}"
+                
+                augmented_data.append(sample)
+    
+    new_counts = Counter([r['labels'] for r in augmented_data])
+    print(f"过采样后类别分布: {dict(new_counts)}")
+    print(f"总样本数: {len(augmented_data)} (原始: {len(rows)})")
+    
+    return augmented_data
+def prepare_and_balance_data(feature_path, split, feature_type, augment_train=True):
+    """
+    准备并平衡数据（统一数据处理逻辑）
+    """
+    feature_data = load_feature_pickle(feature_path, split)
+    rows = prepare_rows_from_feature_data(feature_data, feature_type)
+    
+    # 打印关键信息
+    print(f"\n=== {split}集数据信息 ===")
+    print(f"样本数量: {len(rows)}")
+    
+    # 标签分布统计
+    if rows:
+        original_labels = [r['labels'] for r in rows]
+        label_counter = Counter(original_labels)
+        print(f"标签分布: {dict(label_counter)}")
+        
+        # 只对训练集进行过采样和增强
+        if split == 'train' and augment_train:
+            rows = oversample_training_data(rows, augment_minority=True)
+            binary_labels = [r['labels'] for r in rows]
+            binary_counter = Counter(binary_labels)
+        else:
+            binary_labels = [0 if label == 0 else 1 for label in original_labels]
+            binary_counter = Counter(binary_labels)
+        print(f"二分类分布: 阴性(0): {binary_counter[0]}, 阳性(1): {binary_counter[1]}")
+        
+        # 数据形状信息
+        sample_shape = rows[0]['data'].shape
+        print(f"数据形状: (时间点, 通道数) = {sample_shape}")
+    
+    return rows
 def process_split(split_name, rows, out_dir, feature_path, region_map, global_edges, node_extractor,
                   k_intra, k_global, w1, w2, fs, device, batch_size, save_npy):
     out = {}
@@ -140,6 +273,7 @@ def run_on_gpu(rank, args, all_rows, splits, region_map, global_edges):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--feature_path', type=str, required=True)
+    parser.add_argument('--feature_type',type=str,default='oxy',choices=['oxy','dxy','both'])
     parser.add_argument('--out_dir', type=str, default='processed_fnirs')
     parser.add_argument('--k_intra', type=int, default=8)
     parser.add_argument('--k_global', type=int, default=8)
@@ -153,15 +287,15 @@ def main():
     parser.add_argument('--save_npy', type=bool, default=True, help='Save individual .npy files for each sample')
     parser.add_argument('--global_edges_sample_size', type=int, default=200,
                         help='Number of samples to use for global edges computation')
+    parser.add_argument('--augment_train', type=bool, default=True)
     args = parser.parse_args()
 
     splits = ['train', 'val', 'test']
     all_rows = {}
     for s in splits:
-        feature_data = load_feature_pickle(args.feature_path, s)
-        rows = prepare_rows_from_feature_data(feature_data, args.feature_type)
-        all_rows[s] = rows
-        print(f"{s}: {len(rows)} samples | label dist: {Counter([r['labels'] for r in rows])}")
+        augment=(s=='train')and args.augment_train
+        all_rows[s] = prepare_and_balance_data(args.feature_path, s, args.feature_type, augment_train=augment)
+        print(f"{s}: {len(all_rows[s])} samples | label dist: {Counter([r['labels'] for r in all_rows[s]])}")
 
     region_map_path = os.path.join(args.feature_path, 'region_map.npy')
     if os.path.exists(region_map_path):

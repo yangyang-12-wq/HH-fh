@@ -372,62 +372,62 @@ def prepare_rows_from_feature_data(feature_data, feature_type):
 
         rows.append({'id': sid, 'data': ts, 'labels': int(label)})
     return rows
-#这个就是用来构建RBF核的 输入的是一个二维张量
-def rbf_gram_torch(x, sigma=None):
-    device = x.device
-    dists = torch.cdist(x, x, p=2.0)  # (N,N)
-    d2 = dists ** 2
-    if sigma is None:
-        n = x.size(0)
-        if n * n - n <= 0:
-            sigma = 1.0
-        else:
-            triu_inds = torch.triu_indices(n, n, offset=1)
-            vals = d2[triu_inds[0], triu_inds[1]]
-            nz = vals[vals > 0]
-            if nz.numel() == 0:
-                sigma = 1.0
-            else:
-                med = torch.median(nz)
-                sigma = torch.sqrt(med + 1e-8)
-                if sigma <= 0:
-                    sigma = 1.0
-    denom = 2.0 * (sigma ** 2) + 1e-12
-    K = torch.exp(-d2 / denom)
-    return K
+# #这个就是用来构建RBF核的 输入的是一个二维张量
+# def rbf_gram_torch(x, sigma=None):
+#     device = x.device
+#     dists = torch.cdist(x, x, p=2.0)  # (N,N)
+#     d2 = dists ** 2
+#     if sigma is None:
+#         n = x.size(0)
+#         if n * n - n <= 0:
+#             sigma = 1.0
+#         else:
+#             triu_inds = torch.triu_indices(n, n, offset=1)
+#             vals = d2[triu_inds[0], triu_inds[1]]
+#             nz = vals[vals > 0]
+#             if nz.numel() == 0:
+#                 sigma = 1.0
+#             else:
+#                 med = torch.median(nz)
+#                 sigma = torch.sqrt(med + 1e-8)
+#                 if sigma <= 0:
+#                     sigma = 1.0
+#     denom = 2.0 * (sigma ** 2) + 1e-12
+#     K = torch.exp(-d2 / denom)
+#     return K
 
-def linear_gram_torch(x):
-    return x @ x.t()
-#对核矩阵中心化 然后让它的均值为零
-def center_gram_torch(K):
-    n = K.size(0)
-    device = K.device
-    ones = torch.ones((n, n), device=device) / n
-    H = torch.eye(n, device=device) - ones
-    Kc = H @ K @ H
-    return Kc
-#计算两个矩阵之间的HSIC 值
-def hsic_from_grams_torch(K, L, normalize=False):
-    Kc = center_gram_torch(K)
-    Lc = center_gram_torch(L)
-    n = K.size(0)
-    denom = (n - 1) ** 2 if n > 1 else 1.0
-    val = torch.trace(Kc @ Lc) / denom
-    if normalize:
-        denom2 = torch.norm(Kc) * torch.norm(Lc) + 1e-12
-        return val / denom2
-    return val
-#这个就是比较的接口
-def hsic_torch(x, y, kernel='rbf', sigma=None, normalize=False):
-    if kernel == 'rbf':
-        K = rbf_gram_torch(x, sigma)
-        L = rbf_gram_torch(y, sigma)
-    elif kernel == 'linear':
-        K = linear_gram_torch(x)
-        L = linear_gram_torch(y)
-    else:
-        raise ValueError("Unknown kernel")
-    return hsic_from_grams_torch(K, L, normalize=normalize)
+# def linear_gram_torch(x):
+#     return x @ x.t()
+# #对核矩阵中心化 然后让它的均值为零
+# def center_gram_torch(K):
+#     n = K.size(0)
+#     device = K.device
+#     ones = torch.ones((n, n), device=device) / n
+#     H = torch.eye(n, device=device) - ones
+#     Kc = H @ K @ H
+#     return Kc
+# #计算两个矩阵之间的HSIC 值
+# def hsic_from_grams_torch(K, L, normalize=False):
+#     Kc = center_gram_torch(K)
+#     Lc = center_gram_torch(L)
+#     n = K.size(0)
+#     denom = (n - 1) ** 2 if n > 1 else 1.0
+#     val = torch.trace(Kc @ Lc) / denom
+#     if normalize:
+#         denom2 = torch.norm(Kc) * torch.norm(Lc) + 1e-12
+#         return val / denom2
+#     return val
+# #这个就是比较的接口
+# def hsic_torch(x, y, kernel='rbf', sigma=None, normalize=False):
+#     if kernel == 'rbf':
+#         K = rbf_gram_torch(x, sigma)
+#         L = rbf_gram_torch(y, sigma)
+#     elif kernel == 'linear':
+#         K = linear_gram_torch(x)
+#         L = linear_gram_torch(y)
+#     else:
+#         raise ValueError("Unknown kernel")
+#     return hsic_from_grams_torch(K, L, normalize=normalize)
 
 def symmetrize_and_normalize(A):
     if A.dim() == 2:
