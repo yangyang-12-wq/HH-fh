@@ -3,7 +3,7 @@ import copy
 from datetime import datetime
 
 import numpy as np
-from sklearn.base import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import global_mean_pool
@@ -91,7 +91,6 @@ class Experiment:
         if nb == 0:
             return 0.0, 0.0, 0.0, 0.0
         avg_loss = total_loss / nb
-        from sklearn.metrics import accuracy_score, f1_score
         acc = accuracy_score(all_labels, all_preds)
         f1m = f1_score(all_labels, all_preds, average='macro')
         f1mi = f1_score(all_labels, all_preds, average='micro')
@@ -105,7 +104,7 @@ class Experiment:
         self.device = device
         torch.cuda.set_device(args.gpu)
         #原始的邻接矩阵adjs_original
-        data_root='././proceed_data'
+        data_root='../../processed_data'
         train_dataset=BrainGraphDataset(root=data_root, split='train')
         val_dataset=BrainGraphDataset(root=data_root, split='val')
         test_dataset=BrainGraphDataset(root=data_root, split='test')
@@ -211,7 +210,7 @@ class Experiment:
 
 
                 if epoch % args.eval_freq == 0:
-                    val_loss, val_acc, val_f1_macro, val_f1_micro = self.test_cls_graphlevel(self, encoder, classifier, val_loader,specific_graph_learner,fused_graph_learner,args)
+                    val_loss, val_acc, val_f1_macro, val_f1_micro = self.test_cls_graphlevel(encoder, classifier, val_loader,specific_graph_learner,fused_graph_learner,args)
                     print(f"Val Acc: {val_acc:.4f}  Val Loss: {val_loss:.4f}  Val F1_macro: {val_f1_macro:.4f}")
                     if val_acc > best_val:
                         best_val = val_acc
@@ -228,7 +227,7 @@ class Experiment:
                     m.load_state_dict(best_state['specific'][i])
                 fused_graph_learner.load_state_dict(best_state['fused'])
 
-            test_loss, test_acc, test_f1_macro, test_f1_micro = self.test_cls_graphlevel(self, encoder, classifier, test_loader,specific_graph_learner,fused_graph_learner,args)
+            test_loss, test_acc, test_f1_macro, test_f1_micro = self.test_cls_graphlevel(encoder, classifier, test_loader,specific_graph_learner,fused_graph_learner,args)
             print(f"Trial {trial} TEST acc: {test_acc:.4f}  f1_macro: {test_f1_macro:.4f}")
             if args.downstream_task == 'classification':
                 validation_accuracies.append(best_val)
