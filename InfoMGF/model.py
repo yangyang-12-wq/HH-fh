@@ -6,9 +6,61 @@ from graph_learner import *
 from layers import GCNConv_dense, GCNConv_dgl
 from torch.nn import Sequential, Linear, ReLU
 from torch_geometric.nn import global_mean_pool
-from torch_geometric.utils import to_laplacian,to_dense_adj
+from torch_geometric.utils import to_dense_adj,dense_to_sparse 
+EPS = 1e-12
+def _adj_to_dense(adj, n_nodes=None, device=None):
+    """
+    支持输入：
+      - DGLGraph (dgl.DGLGraph / DGLHeteroGraph)
+      - torch.sparse_coo_tensor
+      - torch.Tensor (dense)
+      - edge_index (Tensor 2 x E) 或 tuple (edge_index, num_nodes)
+    返回 dense torch.FloatTensor (n_nodes x n_nodes) 在指定 device 上。
+    """
+    # DGL 图
+    if isinstance(adj, (dgl.DGLGraph, dgl.DGLHeteroGraph)):
+        g = adj
+        n = n_nodes if n_nodes is not None else g.num_nodes()
+        device = device if device is not None else (g.device if hasattr(g, 'device') else torch.device('cpu'))
+        # 若有边权 'w' 则用它，否则用 1
+        if 'w' in g.edata:
+            vals = g.edata['w'].to(device)
+        else:
+            u, v = g.edges()
+            vals = torch.ones(u.shape[0], device=device)
+        u, v = g.edges()
+        indices = torch.stack([u, v], dim=0).to(device)
+        A_sparse = torch.sparse_coo_tensor(indices, vals, (n, n), device=device).coalesce()
+        return A_sparse.to_dense().float()
 
+    # torch.sparse_coo_tensor
+    if isinstance(adj, torch.Tensor) and adj.is_sparse:
+        device = device if device is not None else adj.device
+        return adj.coalesce().to_dense().to(device).float()
 
+    # dense torch tensor
+    if isinstance(adj, torch.Tensor):
+        device = device if device is not None else adj.device
+        return adj.to(device).float()
+
+    # edge_index 2xE
+    if isinstance(adj, (list, tuple)) and len(adj) >= 1:
+        edge_index = adj[0]
+        if isinstance(edge_index, torch.Tensor) and edge_index.dim() == 2:
+            if len(adj) == 2 and adj[1] is not None:
+                n = adj[1]
+            else:
+                # infer n from max index
+                n = int(edge_index.max().item()) + 1
+            device = device if device is not None else edge_index.device
+            rows = edge_index[0].to(device)
+            cols = edge_index[1].to(device)
+            vals = torch.ones(rows.size(0), device=device)
+            idx = torch.stack([rows, cols], dim=0)
+            A_sparse = torch.sparse_coo_tensor(idx, vals, (n, n), device=device).coalesce()
+            return A_sparse.to_dense().float()
+
+    raise TypeError(f"Unsupported adj type: {type(adj)}. Provide DGLGraph / sparse_coo / dense tensor / (edge_index, n_nodes).")
 # GCN for evaluation.
 class GCN(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers, dropout, dropout_adj, Adj, sparse):
@@ -53,7 +105,7 @@ class GraphEncoder(nn.Module):
         self.dropout = dropout
         self.gnn_encoder_layers = nn.ModuleList()
         self.act = nn.ReLU()
-
+        self.num_g = 2  
         if sparse:
             self.gnn_encoder_layers.append(GCNConv_dgl(in_dim, hidden_dim))
             for _ in range(nlayers - 2):
@@ -130,7 +182,7 @@ class GraphEncoder(nn.Module):
         }
         return total_loss, loss_details
         
-class GraphEncoderWithPooling(nn.Moudle):
+class GraphEncoderWithPooling(nn.Module):
     def __init__(self, nlayers, in_dim, hidden_dim, emb_dim, dropout, sparse):
         super().__init__()
         self.encoder = GraphEncoder(nlayers, in_dim, hidden_dim, emb_dim, dropout, sparse)
@@ -206,18 +258,41 @@ def compute_lfd_loss_optimized(z_teacher, h_student, adj_teacher, temperature=1.
     #下面这个是对于S_high的计算，然后它的原理是让内部的图信号（经过卷积得到的节点嵌入）
     #去放到全局视图上去评估 同样的交叉操作一下
     #这里是到loss的时候要进行相减的操作
-def compute_s_high(x,adj):
-        num_nodes=x.size(0)
-        edge_index,_=torch_geometric.utils.dense_to_sparse(adj)
-        laplacian_edge_index, laplacian_edge_weight = to_laplacian(edge_index, num_nodes=num_nodes, normalization='sym')
-        L = to_dense_adj(laplacian_edge_index, edge_attr=laplacian_edge_weight)
-        if x.dim() == 1:
-            x = x.unsqueeze(1)
-        numerator = torch.einsum('nf, nm, mf -> f', x.t(), L.squeeze(0), x)
-        denominator = torch.einsum('nf, nf -> f', x.t(), x)
-        s_high_values = numerator / (denominator + 1e-8) # 加一个小的常数防止除以0
-        s_high = s_high_values.mean() # 对所有特征维度求平均
-        return s_high
+def compute_s_high(x, adj):
+    """
+    计算图信号的高频能量度量（S_high）。
+    x: (N, F) 节点嵌入 torch.Tensor
+    adj: DGLGraph / sparse coo / dense tensor / (edge_index, n_nodes)
+    返回 scalar torch.Tensor
+    """
+    if not torch.is_tensor(x):
+        x = torch.tensor(x).float()
+
+    device = x.device
+    N = x.size(0)
+
+    A = _adj_to_dense(adj, n_nodes=N, device=device)  # (N,N) float
+    # 如果 A 全零（孤立图），返回 0 防止数值异常
+    if torch.allclose(A, torch.zeros_like(A)):
+        return torch.tensor(0.0, device=device)
+
+    # 归一化对称拉普拉斯 L = I - D^{-1/2} A D^{-1/2}
+    deg = A.sum(dim=1)  # (N,)
+    deg_inv_sqrt = torch.where(deg > 0, deg.pow(-0.5), torch.zeros_like(deg))
+    D_inv_sqrt = torch.diag(deg_inv_sqrt)
+    A_norm = D_inv_sqrt @ A @ D_inv_sqrt
+    I = torch.eye(N, device=device, dtype=A_norm.dtype)
+    L = I - A_norm  # (N,N)
+
+    # numerator per feature: x_f^T L x_f
+    XLX = x.t() @ L @ x  # (F, F)
+    numerator = torch.diag(XLX)  # (F,)
+    denom_mat = x.t() @ x  # (F, F)
+    denominator = torch.diag(denom_mat)  # (F,)
+
+    s_high_vals = numerator / (denominator + EPS)
+    s_high = s_high_vals.mean()
+    return s_high
     #下面是第三个损失函数用在不同的视图的节点嵌入之间整体分布形状是否相似
 '''
 # Z_s_intra = gnn_encoder(X_s_intra, A_s_intra)
@@ -227,23 +302,38 @@ def compute_s_high(x,adj):
 sc_loss = compute_sc_loss(Z_s_intra, Z_s_global, h=1.0)
 '''
 def gaussian_kernel(x, y, h):
-        x, y = x.to(y.device), y.to(x.device)
-        diff = x.unsqueeze(1) - y.unsqueeze(0)
-        dist_sq = torch.sum(diff ** 2, dim=-1)
-        return torch.exp(-dist_sq / (2 * h ** 2))
-def js_divergence(P,Q):
-        P=P/P.sum(dim=-1,keepdim=True)
-        Q=Q/Q.sum(dim=-1,keepdim=True)
-        M=0.5*(P+Q)
-        kl_pm=F.kl_div(P.log(),M,reduction='batchmean')
-        kl_qm=F.kl_div(Q.log(),M,reduction='batchmean')
-        return 0.5*(kl_pm+kl_qm)
-def compute_sc_loss(Z_s_intra,Z_s_global,h=1.0):
-        device=Z_s_intra
-        Z_s_global=Z_s_intra.to(device)
-        K_intra_global=gaussian_kernel(Z_s_intra,Z_s_global,h)
-        k_global_intra=gaussian_kernel(Z_s_global,Z_s_intra,h)
-        P_est=K_intra_global.mean(dim=0)
-        Q_est=k_global_intra.mean(dim=0)
-        sc_loss=js_divergence(P_est,Q_est)
-        return sc_loss
+    """
+    返回 (Nx, Ny) 的高斯核相似度矩阵
+    """
+    x = x.float()
+    y = y.float()
+    x_norm = (x ** 2).sum(dim=1).unsqueeze(1)  # (Nx,1)
+    y_norm = (y ** 2).sum(dim=1).unsqueeze(0)  # (1,Ny)
+    dist_sq = x_norm + y_norm - 2.0 * (x @ y.t())
+    dist_sq = torch.clamp(dist_sq, min=0.0)
+    K = torch.exp(-dist_sq / (2.0 * (h ** 2 + EPS)))
+    return K
+
+def js_divergence(P, Q):
+    """
+    P, Q: (1, M) 或 (M,) 估计分布（未必归一化）
+    返回：标量 JS 散度
+    """
+    P = P / (P.sum(dim=-1, keepdim=True) + EPS)
+    Q = Q / (Q.sum(dim=-1, keepdim=True) + EPS)
+    M = 0.5 * (P + Q)
+    # 使用 KL-div，先保证无零
+    kl_pm = F.kl_div((P + EPS).log(), M, reduction='batchmean')
+    kl_qm = F.kl_div((Q + EPS).log(), M, reduction='batchmean')
+    return 0.5 * (kl_pm + kl_qm)
+
+def compute_sc_loss(Z_s_intra, Z_s_global, h=1.0):
+    """
+    计算两个视图嵌入分布的分布相似性（JS divergence of kernel estimates）
+    """
+    K_intra_global = gaussian_kernel(Z_s_intra, Z_s_global, h)  # (N,N)
+    K_global_intra = gaussian_kernel(Z_s_global, Z_s_intra, h)  # (N,N)
+    P_est = K_intra_global.mean(dim=0, keepdim=True)  # (1, N)
+    Q_est = K_global_intra.mean(dim=0, keepdim=True)  # (1, N)
+    sc_loss = js_divergence(P_est, Q_est)
+    return sc_loss
