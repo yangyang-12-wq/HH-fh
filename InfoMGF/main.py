@@ -154,7 +154,7 @@ class Experiment:
         self.device = device
         torch.cuda.set_device(args.gpu)
         #原始的邻接矩阵adjs_original
-        data_root='../../processed_data1'
+        data_root='../../processed_data'
         train_dataset=BrainGraphDataset(root=data_root, split='train')
         val_dataset=BrainGraphDataset(root=data_root, split='val')
         test_dataset=BrainGraphDataset(root=data_root, split='test')
@@ -261,7 +261,7 @@ class Experiment:
                         best_state = {
                             'encoder': encoder.state_dict(),
                             'classifier': classifier.state_dict(),
-                            'specific': [m.state_dict() for m in specific_graph_learner],
+                            'specific': specific_graph_learner.state_dict(),
                             'attention_fusion': attention_fusion.state_dict()
                         }
                     if best_val_metrics is not None:
@@ -273,8 +273,7 @@ class Experiment:
                     if best_state is not None:
                         encoder.load_state_dict(best_state['encoder'])
                         classifier.load_state_dict(best_state['classifier'])
-                        for i, m in enumerate(specific_graph_learner):
-                            m.load_state_dict(best_state['specific'][i])
+                        specific_graph_learner.load_state_dict(best_state['specific'])
                         attention_fusion.load_state_dict(best_state['attention_fusion'])
 
             test_loss, test_metrics = self.test_cls_graphlevel(encoder, classifier, test_loader,specific_graph_learner,attention_fusion,args,trial,'test')
