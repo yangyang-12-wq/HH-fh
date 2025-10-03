@@ -128,7 +128,7 @@ class GraphEncoder(nn.Module):
 
         x = self.gnn_encoder_layers[-1](x, Adj)
         return x
-    def cal_custom_loss(self, z_specific_adjs, z_fused_adj, specific_adjs, fused_adj, 
+    def cal_custom_loss(self, z_specific_adjs, z_fused_adj, specific_adjs, 
                        temperature=1.0, h=1.0, alpha=1.0, beta=1.0, gamma=1.0):
 
         

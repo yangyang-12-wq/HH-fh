@@ -58,3 +58,24 @@ class ATT_learner(nn.Module):
             learned_adj = F.dropout(learned_adj, p=self.dropedge_rate, training=self.training)
 
             return learned_adj
+class AttentionFusion(nn.Module):
+    def __init__(self, input_dim, num_views=2):
+        super(AttentionFusion, self).__init__()
+        self.num_views = num_views
+        self.attention_mlp = nn.Sequential(
+            nn.Linear(input_dim * num_views, input_dim),
+            nn.ReLU(),
+            nn.Linear(input_dim, num_views)
+        )
+        
+    def forward(self, view_features):
+
+        concatenated = torch.cat(view_features, dim=1)  
+        scores = self.attention_mlp(concatenated)  
+        attention_weights = F.softmax(scores, dim=1)  
+        fused_feature = torch.zeros_like(view_features[0])
+        for i in range(self.num_views):
+            weight = attention_weights[:, i].unsqueeze(1)
+            fused_feature += weight * view_features[i]
+        
+        return fused_feature, attention_weights

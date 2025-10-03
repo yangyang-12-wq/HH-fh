@@ -18,6 +18,7 @@ from utils_graph_build import (
     brain_regions
 )
 from node_extractor import *
+
 class DataAugmentor:
     @staticmethod
     def time_shifting(data):
@@ -27,6 +28,7 @@ class DataAugmentor:
             return torch.roll(data, shifts=shift, dims=0)
         else:  # numpy array
             return np.roll(data, shift=shift, axis=0)
+    
     @staticmethod
     def time_reversal(data):
         # 时间反转
@@ -70,44 +72,24 @@ class DataAugmentor:
         ]
         method = random.choice(augmentation_methods)
         return method(data)
+
 def oversample_training_data(rows, augment_minority=True):
-    """
-    对训练集进行过采样
-    """
-    # 先处理成二分类（根据师兄的逻辑）
-    processed_rows = []
-    for row in rows:
-        label = row['labels']
-        if label in [0, 1, 2, 3, 4]:  # 过滤有效标签
-            # 二分类：0 vs 1-4 -> 1
-            binary_label = 0 if label == 0 else 1
-            processed_rows.append({
-                'id': row['id'],
-                'data': row['data'],
-                'labels': binary_label
-            })
-    
-    rows = processed_rows
-    
-    # 计算类别分布
     label_counts = Counter([r['labels'] for r in rows])
     max_count = max(label_counts.values())
     
     print(f"原始类别分布: {dict(label_counts)}")
     
     augmented_data = rows.copy()
-    
-    # 对少数类进行过采样
+
     for label, count in label_counts.items():
         if count < max_count:
             minority_samples = [r for r in rows if r['labels'] == label]
             needed = max_count - count
             
             for i in range(needed):
-                # 随机选择一个少数类样本
+
                 sample = random.choice(minority_samples).copy()
-                
-                # 应用数据增强
+
                 if augment_minority:
                     sample['data'] = DataAugmentor.augment_data(sample['data'])
                     sample['id'] = f"{sample['id']}_aug_{i}"
@@ -119,10 +101,8 @@ def oversample_training_data(rows, augment_minority=True):
     print(f"总样本数: {len(augmented_data)} (原始: {len(rows)})")
     
     return augmented_data
+
 def prepare_and_balance_data(feature_path, split, feature_type, augment_train=True):
-    """
-    准备并平衡数据（统一数据处理逻辑）
-    """
     feature_data = load_feature_pickle(feature_path, split)
     rows = prepare_rows_from_feature_data(feature_data, feature_type)
     
@@ -134,27 +114,24 @@ def prepare_and_balance_data(feature_path, split, feature_type, augment_train=Tr
     if rows:
         original_labels = [r['labels'] for r in rows]
         label_counter = Counter(original_labels)
-        print(f"标签分布: {dict(label_counter)}")
+        print(f"多分类标签分布: {dict(label_counter)}")
         
         # 只对训练集进行过采样和增强
         if split == 'train' and augment_train:
             rows = oversample_training_data(rows, augment_minority=True)
-            binary_labels = [r['labels'] for r in rows]
-            binary_counter = Counter(binary_labels)
-        else:
-            binary_labels = [0 if label == 0 else 1 for label in original_labels]
-            binary_counter = Counter(binary_labels)
-        print(f"二分类分布: 阴性(0): {binary_counter[0]}, 阳性(1): {binary_counter[1]}")
+            new_label_counter = Counter([r['labels'] for r in rows])
+            print(f"过采样后多分类分布: {dict(new_label_counter)}")
         
         # 数据形状信息
         sample_shape = rows[0]['data'].shape
         print(f"数据形状: (时间点, 通道数) = {sample_shape}")
     
     return rows
+
 def process_split(split_name, rows, out_dir, feature_path, region_map, global_edges, node_extractor,
                   k_intra, k_global, w1, w2, fs, device, batch_size, save_npy):
     out = {}
-    adjs_dir = os.path.join(feature_path, 'adjs_precomputed')
+    adjs_dir = os.path.join(feature_path, 'adjs_precomputed1')
     safe_makedirs(adjs_dir)
     safe_makedirs(out_dir)
 
@@ -188,7 +165,6 @@ def process_split(split_name, rows, out_dir, feature_path, region_map, global_ed
 
             node_feats_np = feats_batch_np[j]
 
-            # build intra/global (CPU-bound)
             G_intra, _, _ = build_intra_region_view_mi(
                 ts_np, region_map, global_edges,
                 n_bins=16, strategy="uniform",
@@ -297,7 +273,7 @@ def main():
         all_rows[s] = prepare_and_balance_data(args.feature_path, s, args.feature_type, augment_train=augment)
         print(f"{s}: {len(all_rows[s])} samples | label dist: {Counter([r['labels'] for r in all_rows[s]])}")
 
-    region_map_path = os.path.join(args.feature_path, 'region_map.npy')
+    region_map_path = os.path.join(args.feature_path, 'region_map1.npy')
     if os.path.exists(region_map_path):
         region_map = np.load(region_map_path)
         print("Loaded region_map from", region_map_path)
@@ -307,7 +283,7 @@ def main():
         np.save(region_map_path, region_map)
         print("Saved region_map to", region_map_path)
 
-    global_edges_path = os.path.join(args.feature_path, 'global_edges.npy')
+    global_edges_path = os.path.join(args.feature_path, 'global_edges1.npy')
     if os.path.exists(global_edges_path):
         global_edges = np.load(global_edges_path, allow_pickle=True)
         print("Loaded global_edges from", global_edges_path)
