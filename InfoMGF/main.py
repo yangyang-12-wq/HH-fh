@@ -267,7 +267,7 @@ class Experiment:
                     if best_val_metrics is not None:
                         val_results.append({
                             'trial': trial,
-                            'accuracy': best_val,
+                            'acc': best_val,
                             'metrics': best_val_metrics
                         })
                     if best_state is not None:
@@ -280,7 +280,7 @@ class Experiment:
             print(f"Trial {trial} TEST acc: {test_metrics['acc']:.4f}  f1_macro: {test_metrics['f1_macro']:.4f}")
             test_results.append({
                 'trial': trial,
-                'accuracy': test_metrics['acc'],
+                'acc': test_metrics['acc'],
                 'metrics': test_metrics
             })
         if args.downstream_task == 'classification' and len(test_results) > 0:
@@ -324,7 +324,7 @@ class Experiment:
                 trial = trial_result['trial']
                 metrics = trial_result['metrics']
                 fh.write(f"\nTrial {trial}:\n")
-                fh.write(f"  Accuracy: {metrics['accuracy']:.4f}\n")
+                fh.write(f"  Accuracy: {metrics['acc']:.4f}\n")
                 fh.write(f"  F1-Macro: {metrics['f1_macro']:.4f}\n")
                 fh.write(f"  Precision-Macro: {metrics['precision_macro']:.4f}\n")
                 fh.write(f"  Recall-Macro: {metrics['recall_macro']:.4f}\n")
