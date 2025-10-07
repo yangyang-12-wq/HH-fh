@@ -1,7 +1,7 @@
 import argparse
 import copy
 from datetime import datetime
-
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -17,6 +17,7 @@ from sklearn.metrics import f1_score
 from torch_geometric.loader import DataLoader
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score,roc_auc_score,confusion_matrix
 import random
+from torch.utils.tensorboard import SummaryWriter
 
 EOS = 1e-10
 args = set_params()
@@ -25,6 +26,7 @@ class Experiment:
     def __init__(self):
         super(Experiment, self).__init__()
         self.training = False
+        self.writer = None
 
     def setup_seed(self, seed):
         torch.manual_seed(seed)
@@ -59,7 +61,6 @@ class Experiment:
             auc_roc_micro = 0.0
         
         cm = confusion_matrix(all_labels, all_preds)
-        cm=confusion_matrix(all_labels, all_preds)
         print(f"\n=== Detailed Metrics - {np.split} - Trial {trial} ===")
         print(f"Accuracy: {accuracy:.4f}")
         print(f"Precision - Macro: {precision_macro:.4f}, Micro: {precision_micro:.4f}")
@@ -145,7 +146,19 @@ class Experiment:
         all_probs=np.array(all_probs)
         detailed_metrics = self.callculate_detailed(all_labels, all_preds, all_probs, n_classes, trial, split)
         return avg_loss, detailed_metrics
-
+    def calculate_class_weights(self, dataset):
+        """计算类别权重以处理不平衡数据"""
+        labels = []
+        for data in dataset:
+            labels.append(data.y.item())
+        class_counts = np.bincount(labels)
+        n_classes = len(class_counts)
+        
+        weights = len(labels) / (n_classes * class_counts)
+        weights = torch.tensor(weights, dtype=torch.float32)
+        print(f"Class counts: {class_counts}")
+        print(f"Class weights: {weights}")
+        return weights
   
 
     def train(self, args):
@@ -153,12 +166,18 @@ class Experiment:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.device = device
         torch.cuda.set_device(args.gpu)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = f"runs/{args.dataset}_{timestamp}"
+        self.writer = SummaryWriter(log_dir=log_dir)
+        print(f"TensorBoard logs will be saved to: {log_dir}")
         #原始的邻接矩阵adjs_original
-        data_root='../../processed_data'
+        data_root='../../processed_data1'
         train_dataset=BrainGraphDataset(root=data_root, split='train')
         val_dataset=BrainGraphDataset(root=data_root, split='val')
         test_dataset=BrainGraphDataset(root=data_root, split='test')
-
+        class_weights = self.calculate_class_weights(train_dataset)
+        class_weights = class_weights.to(device)
+        criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
         train_loader=DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
         val_loader=DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
         test_loader=DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
@@ -175,20 +194,13 @@ class Experiment:
         test_results = []
         val_results = []
 
-        #     fh = open("result_" + args.dataset + "_Class.txt", "a")
-        #     print(args, file=fh)
-        #     fh.write('\r\n')
-        #     fh.flush()
-        #     fh.close()
+  
 
         for trial in range(args.ntrials):
 
             self.setup_seed(trial)
-            # adjs = copy.deepcopy(adjs_original)
-            # features = copy.deepcopy(features_original)
-            # view_features = AGG([features for _ in range(len(adjs))], adjs, args.r, sparse=args.sparse)
-            # view_features.append(features)
-
+            trial_log_dir = f"{log_dir}/trial_{trial}"
+            trial_writer = SummaryWriter(log_dir=trial_log_dir)
             specific_graph_learner = ATT_learner(2, nfeats, args.k, 6, args.dropedge_rate, args.sparse, args.activation_learner) 
             attention_fusion=AttentionFusion(input_dim=args.emb_dim, num_views=num_views)
             encoder=GraphEncoder(nlayers=args.nlayer_gnn, in_dim=nfeats, hidden_dim=args.hidden_dim, emb_dim=args.emb_dim, dropout=args.dropout, sparse=args.sparse)
@@ -203,19 +215,28 @@ class Experiment:
             params.append({'params': classifier.parameters()})
             params.append({'params': attention_fusion.parameters()})
             optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.w_decay)
-            # if torch.cuda.is_available():
-            #     model = model.cuda()
-            #     specific_graph_learner = [m.cuda() for m in specific_graph_learner]
-            #     fused_graph_learner = fused_graph_learner.cuda()
             best_val = -1.0
             best_state = None
             best_val_metrics=None
+            epoch_losses = {
+                'total': [],
+                'supervised': [],
+                'self_supervised': [],
+                'lfd': [],
+                's_high': [],
+                'sc': []
+            }
             for epoch in range(1, args.epochs + 1):
                 encoder.train()
                 classifier.train()
                 specific_graph_learner.train()
                 attention_fusion.train()
                 total_loss = 0.0
+                total_sup_loss = 0.0
+                total_self_loss = 0.0
+                total_lfd_loss = 0.0
+                total_s_high_loss = 0.0
+                total_sc_loss = 0.0
                 n_batches = 0
                 for batch in train_loader:
                     batch = batch.to(device)
@@ -237,45 +258,79 @@ class Experiment:
                     fused_z,attention_weights = attention_fusion(z_specifics)
                     graph_emb = global_mean_pool(fused_z, node2graph)
                     logits = classifier(graph_emb)
-                    loss_sup = F.cross_entropy(logits, batch.y.view(-1))
-                    loss_self,loss_details=encoder.cal_custom_loss(z_specifics,fused_z,sparse_specific_adjs
+                    loss_sup = criterion(logits, batch.y.view(-1))
+                    loss_self,loss_details=encoder.cal_custom_loss(z_specifics,fused_z,learned_specific_adjs
                                                                 ,args.tau,args.h,args.alpha,args.beta,args.gamma)
                     loss=loss_sup+args.lambda1*loss_self
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
                     total_loss += float(loss.item())
+                    total_sup_loss += float(loss_sup.item())
+                    total_self_loss += float(loss_self.item())
+                    total_lfd_loss += float(loss_details['lfd_loss'].item())
+                    total_s_high_loss += float(loss_details['s_high_loss'].item())
+                    total_sc_loss += float(loss_details['sc_loss'].item())
                     n_batches += 1
                 
                 avg_loss = total_loss / n_batches if n_batches > 0 else 0.0
-                print(f"Trial {trial} Epoch {epoch}  Loss {avg_loss:.4f}")
-            
-
-
+                avg_loss = total_loss / n_batches if n_batches > 0 else 0.0
+                avg_sup_loss = total_sup_loss / n_batches if n_batches > 0 else 0.0
+                avg_self_loss = total_self_loss / n_batches if n_batches > 0 else 0.0
+                avg_lfd_loss = total_lfd_loss / n_batches if n_batches > 0 else 0.0
+                avg_s_high_loss = total_s_high_loss / n_batches if n_batches > 0 else 0.0
+                avg_sc_loss = total_sc_loss / n_batches if n_batches > 0 else 0.0
+                trial_writer.add_scalar('Loss/Total', avg_loss, epoch)
+                trial_writer.add_scalar('Loss/Supervised', avg_sup_loss, epoch)
+                trial_writer.add_scalar('Loss/Self_Supervised', avg_self_loss, epoch)
+                trial_writer.add_scalar('Loss/LFD', avg_lfd_loss, epoch)
+                trial_writer.add_scalar('Loss/S_High', avg_s_high_loss, epoch)
+                trial_writer.add_scalar('Loss/SC', avg_sc_loss, epoch)
+                epoch_losses['total'].append(avg_loss)
+                epoch_losses['supervised'].append(avg_sup_loss)
+                epoch_losses['self_supervised'].append(avg_self_loss)
+                epoch_losses['lfd'].append(avg_lfd_loss)
+                epoch_losses['s_high'].append(avg_s_high_loss)
+                epoch_losses['sc'].append(avg_sc_loss)
+                
+                print(f"Trial {trial} Epoch {epoch} - "
+                      f"Total: {avg_loss:.4f}, Sup: {avg_sup_loss:.4f}, Self: {avg_self_loss:.4f}, "
+                      f"LFD: {avg_lfd_loss:.4f}, S_high: {avg_s_high_loss:.4f}, SC: {avg_sc_loss:.4f}")
                 if epoch % args.eval_freq == 0:
                     val_loss,val_metrics = self.test_cls_graphlevel(encoder, classifier, val_loader,specific_graph_learner,attention_fusion,args,trial,'val')
+                    current_f1 = val_metrics['f1_macro']
                     print(f"Val Acc: {val_metrics['acc']:.4f}  Val Loss: {val_loss:.4f}  Val F1_macro: {val_metrics['f1_macro']:.4f}")
-                    if val_metrics['acc'] > best_val:
-                        best_val = val_metrics['acc']
+                    trial_writer.add_scalar('Validation/Loss', val_loss, epoch)
+                    trial_writer.add_scalar('Validation/Accuracy', val_metrics['acc'], epoch)
+                    trial_writer.add_scalar('Validation/F1_Macro', val_metrics['f1_macro'], epoch)
+                    trial_writer.add_scalar('Validation/F1_Micro', val_metrics['f1_micro'], epoch)
+                    trial_writer.add_scalar('Validation/Precision_Macro', val_metrics['precision_macro'], epoch)
+                    trial_writer.add_scalar('Validation/Recall_Macro', val_metrics['recall_macro'], epoch)
+                    trial_writer.add_scalar('Validation/AUC_Macro', val_metrics['auc_macro'], epoch)
+                    if current_f1> best_val:
+                        best_val = current_f1
                         best_val_metrics=val_metrics
                         best_state = {
-                            'encoder': encoder.state_dict(),
-                            'classifier': classifier.state_dict(),
-                            'specific': specific_graph_learner.state_dict(),
-                            'attention_fusion': attention_fusion.state_dict()
+                            'encoder': copy.deepcopy(encoder.state_dict()),
+                            'classifier': copy.deepcopy(classifier.state_dict()),
+                            'specific': copy.deepcopy(specific_graph_learner.state_dict()),
+                            'attention_fusion': copy.deepcopy(attention_fusion.state_dict()),
+                            'optimizer': copy.deepcopy(optimizer.state_dict())
                         }
-                    if best_val_metrics is not None:
-                        val_results.append({
-                            'trial': trial,
-                            'acc': best_val,
-                            'metrics': best_val_metrics
-                        })
-                    if best_state is not None:
-                        encoder.load_state_dict(best_state['encoder'])
-                        classifier.load_state_dict(best_state['classifier'])
-                        specific_graph_learner.load_state_dict(best_state['specific'])
-                        attention_fusion.load_state_dict(best_state['attention_fusion'])
-
+            if best_val_metrics is not None:
+                val_results.append({
+                    'trial': trial,
+                    'acc': best_val_metrics['acc'],
+                    'metrics': best_val_metrics
+                })
+            self.plot_loss_curves(epoch_losses, trial, trial_writer)
+            trial_writer.close()
+            if best_state is not None:
+                encoder.load_state_dict(best_state['encoder'])
+                classifier.load_state_dict(best_state['classifier'])
+                specific_graph_learner.load_state_dict(best_state['specific'])
+                attention_fusion.load_state_dict(best_state['attention_fusion'])
+                print(f"Restored best model with F1_macro: {best_val:.4f} for testing")
             test_loss, test_metrics = self.test_cls_graphlevel(encoder, classifier, test_loader,specific_graph_learner,attention_fusion,args,trial,'test')
             print(f"Trial {trial} TEST acc: {test_metrics['acc']:.4f}  f1_macro: {test_metrics['f1_macro']:.4f}")
             test_results.append({
@@ -285,6 +340,62 @@ class Experiment:
             })
         if args.downstream_task == 'classification' and len(test_results) > 0:
             self.print_results(val_results, test_results)
+
+    def plot_loss_curves(self, epoch_losses, trial, writer):
+
+        
+        epochs = list(range(1, len(epoch_losses['total']) + 1))
+        
+        # 创建总loss图
+        plt.figure(figsize=(12, 8))
+        
+        plt.subplot(2, 2, 1)
+        plt.plot(epochs, epoch_losses['total'], 'b-', label='Total Loss', linewidth=2)
+        plt.plot(epochs, epoch_losses['supervised'], 'r-', label='Supervised Loss', linewidth=2)
+        plt.plot(epochs, epoch_losses['self_supervised'], 'g-', label='Self-Supervised Loss', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Main Loss Components')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(2, 2, 2)
+        plt.plot(epochs, epoch_losses['lfd'], 'c-', label='LFD Loss', linewidth=2)
+        plt.plot(epochs, epoch_losses['s_high'], 'm-', label='S_High Loss', linewidth=2)
+        plt.plot(epochs, epoch_losses['sc'], 'y-', label='SC Loss', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Self-Supervised Loss Components')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(2, 2, 3)
+        plt.semilogy(epochs, epoch_losses['total'], 'b-', label='Total Loss', linewidth=2)
+        plt.semilogy(epochs, epoch_losses['supervised'], 'r-', label='Supervised Loss', linewidth=2)
+        plt.semilogy(epochs, epoch_losses['self_supervised'], 'g-', label='Self-Supervised Loss', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss (log scale)')
+        plt.title('Main Loss Components (Log Scale)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(2, 2, 4)
+        plt.semilogy(epochs, epoch_losses['lfd'], 'c-', label='LFD Loss', linewidth=2)
+        plt.semilogy(epochs, epoch_losses['s_high'], 'm-', label='S_High Loss', linewidth=2)
+        plt.semilogy(epochs, epoch_losses['sc'], 'y-', label='SC Loss', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss (log scale)')
+        plt.title('Self-Supervised Loss Components (Log Scale)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+ 
+        plt.savefig(f'loss_curves_trial_{trial}.png', dpi=300, bbox_inches='tight')
+        writer.add_figure('Loss_Curves/Summary', plt.gcf())
+        plt.close()
+        
+        print(f"Loss curves saved for trial {trial}")
     def print_results(self, val_results, test_results):
 
         val_accs = [r['acc'] for r in val_results]
@@ -307,8 +418,7 @@ class Experiment:
         print("="*60)
         for metric, (mean, std) in stats.items():
             print(f"{metric.replace('_', ' ').title():<20}: {mean:.4f} ± {std:.4f}")
-        
-        # 保存到文件
+
         result_file = f"results/result_{args.dataset}_Class.txt"
         with open(result_file, "w") as fh:
             fh.write("FINAL RESULTS ACROSS ALL TRIALS\n")
@@ -316,8 +426,7 @@ class Experiment:
             for metric, (mean, std) in stats.items():
                 line = f"{metric.replace('_', ' ').title():<20}: {mean:.4f} ± {std:.4f}\n"
                 fh.write(line)
-            
-            # 添加每个trial的详细结果
+
             fh.write("\n\nDETAILED TRIAL RESULTS:\n")
             fh.write("="*60 + "\n")
             for trial_result in test_results:
