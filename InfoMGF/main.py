@@ -201,7 +201,13 @@ class Experiment:
             self.setup_seed(trial)
             trial_log_dir = f"{log_dir}/trial_{trial}"
             trial_writer = SummaryWriter(log_dir=trial_log_dir)
-            specific_graph_learner = ATT_learner(2, nfeats, args.k, 6, args.dropedge_rate, args.sparse, args.activation_learner) 
+            specific_graph_learner = GraphLearnerGCN(gcn_input_dim=nfeats,
+                gcn_hidden_dim=args.hidden_dim,
+                gcn_output_dim=args.emb_dim,
+                k=args.k,
+                dropedge_rate=args.dropedge_rate,
+                sparse=args.sparse,
+                act=args.activation_learner) 
             attention_fusion=AttentionFusion(input_dim=args.emb_dim, num_views=num_views)
             encoder=GraphEncoder(nlayers=args.nlayer_gnn, in_dim=nfeats, hidden_dim=args.hidden_dim, emb_dim=args.emb_dim, dropout=args.dropout, sparse=args.sparse)
             classifier=GraphClassifierHead(in_dim=args.emb_dim,nclasses=nclasses)

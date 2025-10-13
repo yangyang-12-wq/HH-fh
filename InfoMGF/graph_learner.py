@@ -1,93 +1,100 @@
 import dgl
 import torch
 import torch.nn as nn
-
+from layers import GCNConv_dense
 from layers import Attentive
 from utils import *
 import math
-class ATT_learner(nn.Module):
-    def __init__(self, nlayers, isize, k, i, dropedge_rate, sparse, act):
-        super(ATT_learner, self).__init__()
-
-        self.layers = nn.ModuleList()
-        for _ in range(nlayers):
-            self.layers.append(Attentive(isize))
-
+class GraphLearnerGCN(nn.Module):
+    def __init__(self, gcn_input_dim, gcn_hidden_dim, gcn_output_dim, k=5, dropedge_rate=0.2, sparse=False, act="relu"):
+        super(GraphLearnerGCN, self).__init__()
+        self.gcn_layers = nn.ModuleList([
+            GCNConv_dense(input_size=gcn_input_dim, output_size=gcn_hidden_dim),
+            GCNConv_dense(input_size=gcn_hidden_dim, output_size=gcn_output_dim)
+        ])
+        self.gcn_act = act
         self.k = k
-        self.non_linearity = 'relu'
-        self.i = i
+        self.non_linearity = "relu"
         self.sparse = sparse
-        self.act = act
         self.dropedge_rate = dropedge_rate
 
-    def internal_forward(self, h):
-        for i, layer in enumerate(self.layers):
-            h = layer(h)
-            if i != (len(self.layers) - 1):
-                if self.act == "relu":
+        for layer in self.gcn_layers:
+            if hasattr(layer, 'linear'):
+                torch.nn.init.xavier_uniform_(layer.linear.weight)
+                if layer.linear.bias is not None:
+                    torch.nn.init.constant_(layer.linear.bias, 0)
+    
+    def forward(self, x, init_adj):
+
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0)
+        
+        h = x
+        for i, layer in enumerate(self.gcn_layers):
+            if isinstance(init_adj, dgl.DGLGraph):
+                h = layer(h, init_adj)
+            else:
+                h = layer(h, init_adj, sparse=self.sparse)
+
+            h = torch.nan_to_num(h, nan=0.0, posinf=1.0, neginf=0.0)
+            
+            if i != len(self.gcn_layers) - 1:
+                if self.gcn_act == "relu":
                     h = F.relu(h)
-                elif self.act == "tanh":
-                    h = F.tanh(h)
-
+                elif self.gcn_act == "tanh":
+                    h = torch.tanh(h)
+                elif self.gcn_act == "sigmoid":
+                    h = torch.sigmoid(h)
+        
         return h
-
-    def forward(self, features):
-        embeddings = self.internal_forward(features)
-
-        return embeddings
-
+    
     def graph_process(self, embeddings):
-        emb=F.normalize(embeddings,p=2,dim=1)
-        emb=torch.nan_to_num(emb,nan=0.0,posinf=0.0,neginf=0.0)
-        d=max(1.0,emb.size(1))
-        sim=torch.matmul(emb,emb.t())/math.sqrt(d)
-        sim=sim-torch.eye(sim.size(0),device=sim.device)*1e9
-        attn=F.softmax(sim,dim=1)
-  
-        if (self.k is not None) and (0 < self.k < attn.size(1)):
-            topk_vals, topk_idx = torch.topk(attn, self.k, dim=1) 
-            mask = torch.zeros_like(attn)
-            mask.scatter_(1, topk_idx, 1.0)
-            attn = attn * mask
 
+        embeddings = torch.nan_to_num(embeddings, nan=0.0, posinf=1.0, neginf=0.0)
+        emb = F.normalize(embeddings, p=2, dim=1)
+        emb = torch.nan_to_num(emb, nan=0.0, posinf=1.0, neginf=0.0)
+  
+        d = max(1.0, emb.size(1))
+        sim = torch.matmul(emb, emb.t()) / math.sqrt(d)
+        sim = torch.clamp(sim, min=-50, max=50)
+        mask = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
+        sim = sim.masked_fill(mask, float('-inf'))
+        
+
+        sim_max = torch.max(sim, dim=1, keepdim=True)[0]
+        sim_exp = torch.exp(sim - sim_max)
+        sim_sum = torch.sum(sim_exp, dim=1, keepdim=True)
+        attn = sim_exp / (sim_sum + 1e-12)
+
+        if (self.k is not None) and (0 < self.k < attn.size(1)):
+            topk_vals, topk_idx = torch.topk(attn, self.k, dim=1)
+            
+            mask = torch.zeros_like(attn)
+            mask = mask.scatter(1, topk_idx, 1.0)
+            
+            attn = attn * mask
             row_sum = attn.sum(dim=1, keepdim=True)
             attn = attn / (row_sum + 1e-12)
+
         attn = (attn + attn.t()) / 2.0
-        def _apply_nonlin_tensor(x, non_lin, param_i):
-            if non_lin == 'relu':
-                return F.relu(x)
-            elif non_lin == 'tanh':
-                return torch.tanh(x)
-            elif non_lin == 'sigmoid':
-                return torch.sigmoid(x)
-            elif non_lin == 'softplus':
-                return F.softplus(x)
-            else:
-                return x
-        try:
-            attn = apply_non_linearity(attn, self.non_linearity, self.i)
-        except Exception:
-            attn = _apply_nonlin_tensor(attn, self.non_linearity, self.i)
-        learned_adj = F.dropout(attn, p=self.dropedge_rate, training=self.training)
-        if self.sparse and (not self.training):
-            try:
-                rows, cols, values = knn_fast(embeddings, self.k, 1000)
-                rows_ = torch.cat((rows, cols))
-                cols_ = torch.cat((cols, rows))
-                values_ = torch.cat((values, values))
-                try:
-                    values_ = apply_non_linearity(values_, self.non_linearity, self.i)
-                except Exception:
-                    values_ = _apply_nonlin_tensor(values_, self.non_linearity, self.i)
-                values_ = F.dropout(values_, p=self.dropedge_rate, training=self.training)
-                values_ = torch.nan_to_num(values_, nan=0.0, posinf=1.0, neginf=0.0)
-                g = dgl.graph((rows_, cols_), num_nodes=embeddings.shape[0], device=embeddings.device)
-                g.edata['w'] = values_
-                return g
-            except Exception as e:
-                print("Warning: knn_fast->dgl graph failed in inference branch:", e)
-                return learned_adj
+
+        if self.non_linearity == 'relu':
+            attn = F.relu(attn)
+        elif self.non_linearity == 'tanh':
+            attn = torch.tanh(attn)
+        elif self.non_linearity == 'sigmoid':
+            attn = torch.sigmoid(attn)
+
+        attn = torch.nan_to_num(attn, nan=0.0, posinf=1.0, neginf=0.0)
+
+        if self.training:
+            dropout_mask = torch.rand_like(attn) > self.dropedge_rate
+            learned_adj = attn * dropout_mask.float()
+        else:
+            learned_adj = attn
+        learned_adj = torch.nan_to_num(learned_adj, nan=0.0, posinf=1.0, neginf=0.0)
+        
         return learned_adj
+
 class AttentionFusion(nn.Module):
     def __init__(self, input_dim, num_views=2):
         super(AttentionFusion, self).__init__()
