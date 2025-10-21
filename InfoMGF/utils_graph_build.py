@@ -43,82 +43,63 @@ def make_region_map(brain_regions, num_channels):
         print(f"  未分配的通道索引: {[i+1 for i in unassigned_channels]}") 
     return region_map
 
-def compute_global_edges(train_dataset, n_bins=16, strategy="uniform", eps=1e-8):
-    C = train_dataset[0].shape[1]
-    all_data = np.concatenate(train_dataset, axis=0)
-    edges_list = []
-    constant_channels = []
+def discretize_data_per_sample(data, n_bins=16, strategy="uniform", eps=1e-8):
+    T, C = data.shape
+    binned = np.zeros((T, C), dtype=np.int32)
     
+    constant_channels = 0
     for i in range(C):
-        x = all_data[:, i]
-
-        if x.max() - x.min() < eps:
-            edges_list.append(None) 
-            constant_channels.append(i)
-            continue
-        
+        x = data[:, i]
+        x_std = np.std(x)
+        x_range = np.max(x) - np.min(x)
+            
+        # 为当前样本的当前通道单独计算分箱边界
         if strategy == "uniform":
             edges = np.linspace(x.min(), x.max(), n_bins + 1)[1:-1]
         elif strategy == "quantile":
             edges = np.quantile(x, np.linspace(0, 1, n_bins + 1))[1:-1]
         else:
-            raise ValueError(f"Unknown strategy: {strategy}")
+            raise ValueError("Unknown strategy")
         
-        # 验证edges的有效性
+        # 检查边界有效性
         unique_edges = np.unique(edges)
-        if len(unique_edges) < len(edges) * 0.5:  # 如果超过一半的边界值相同
-            print(f"Warning: Channel {i} has low diversity edges (only {len(unique_edges)} unique values)")
-        
-        edges_list.append(edges)
-    
-    if constant_channels:
-        print(f"Found {len(constant_channels)} constant channels: {constant_channels[:10]}{'...' if len(constant_channels) > 10 else ''}")
-    
-    return edges_list
-
-def discretize_data_strict(data, n_bins=16, strategy="uniform", eps=1e-8,
-                           global_edges=None):
-    T, C = data.shape
-    binned = np.zeros((T, C), dtype=np.int32)
-    edges_list = [] if global_edges is None else global_edges
-
-    for i in range(C):
-        x = data[:, i]
-        if global_edges is None:
-            if x.max() - x.min() < eps:
-                edges = None
-                binned[:, i] = 0
-                edges_list.append(edges)
-                continue
-            if strategy == "uniform":
-                edges = np.linspace(x.min(), x.max(), n_bins + 1)[1:-1]
-            elif strategy == "quantile":
-                edges = np.quantile(x, np.linspace(0, 1, n_bins + 1))[1:-1]
-            else:
-                raise ValueError("Unknown strategy")
-            edges_list.append(edges)
-        else:
-            edges = global_edges[i]
-
-        if edges is not None:
-            binned[:, i] = np.digitize(x, edges, right=False)
-
-    return binned, edges_list
+        if len(unique_edges) < len(edges) * 0.5:
+            print(f"Warning: Sample channel {i} has low diversity edges")
+        binned[:, i] = np.digitize(x, edges, right=False)
+    return binned
 
 def _mi_matrix_from_binned(binned_labels):
     W, C = binned_labels.shape
     M = np.zeros((C, C), dtype=float)
+
+    valid_channels = []
     for i in range(C):
         xi = binned_labels[:, i]
-        for j in range(i, C):
+        unique_vals = len(np.unique(xi))
+        if unique_vals > 1:
+            valid_channels.append(i)
+ 
+    if len(valid_channels) < 2:
+        print(f"互信息计算失败: 只有 {len(valid_channels)} 个有效通道")
+        return M
+
+    for i_idx, i in enumerate(valid_channels):
+        xi = binned_labels[:, i]
+        for j in valid_channels[i_idx:]:
             xj = binned_labels[:, j]
-            val = mutual_info_score(xi, xj)
-            M[i, j] = val
-            M[j, i] = val
+            try:
+                val = mutual_info_score(xi, xj)
+                M[i, j] = val
+                M[j, i] = val
+            except Exception:
+                M[i, j] = 0
+                M[j, i] = 0
+    
     return M
 
+
 def build_intra_region_view_mi(
-    time_series_data, region_map, global_edges,
+    time_series_data, region_map, 
     n_bins=16, strategy="uniform",
     window_size=400, stride=200,
     zero_diag=True, eps=1e-8
@@ -131,18 +112,30 @@ def build_intra_region_view_mi(
     A_mean = np.zeros((C, C), dtype=float)
     n_windows = len(window_starts)
     
+    valid_windows = 0
     for start in window_starts:
         end = start + window_size
         window = time_series_data[start:end, :]
+        
+        # 检查窗口数据质量
+        window_std = np.std(window)
+        if window_std < eps:
+            continue
+            
+        valid_windows += 1
 
-        binned, _ = discretize_data_strict(
-            window, n_bins=n_bins, strategy=strategy, eps=eps, global_edges=global_edges
+        # 使用简化的离散化
+        binned= discretize_data_per_sample(
+            window, n_bins=n_bins, strategy=strategy, eps=eps
         )
 
         M_n = _mi_matrix_from_binned(binned)
         A_mean += M_n
 
-    A_mean /= n_windows
+    if valid_windows == 0:
+        return np.zeros((C, C)), np.zeros((C, C)), 0
+        
+    A_mean /= valid_windows
     A_channel = A_mean
 
     intra_mask = np.zeros((C, C), dtype=float)
@@ -159,7 +152,7 @@ def build_intra_region_view_mi(
         np.fill_diagonal(G_intra, 0.0)
         np.fill_diagonal(A_channel, 0.0)
 
-    return G_intra, A_channel, n_windows
+    return G_intra, A_channel, valid_windows
 
 def build_global_view(times_series, w1,w2,fs=1.0):
     T, C = times_series.shape

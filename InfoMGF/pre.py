@@ -30,37 +30,104 @@ class DataAugmentor:
             return np.flip(data, axis=0)
 
     @staticmethod
-    def noise_injection(data):
+    def noise_injection(data, rel_std=0.05, min_abs_noise=1e-6):
         if isinstance(data, torch.Tensor):
-            noise = torch.randn_like(data) * 0.02
-            return data + noise
+            arr = data.cpu().numpy()
+            is_torch = True
         else:
-            noise = np.random.normal(0, 0.02, data.shape)
-            return data + noise
+            arr = data
+            is_torch = False
+
+        T, C = arr.shape
+        noise = np.zeros_like(arr)
+        channel_stds = np.std(arr, axis=0)
+        for c in range(C):
+            sigma = channel_stds[c] * rel_std
+            if sigma < min_abs_noise:
+                sigma = min_abs_noise
+            noise[:, c] = np.random.normal(0.0, sigma, size=T)
+        out = arr + noise
+        if is_torch:
+            return torch.from_numpy(out).to(data.dtype)
+        return out
         
     @staticmethod
-    def time_masking(data):
-        data_copy = data.copy() if isinstance(data, np.ndarray) else data.clone()
-        mask_len = random.randint(50, 300)
-        if isinstance(data_copy, torch.Tensor):
-            mask_start = random.randint(0, data_copy.size(0) - mask_len)
-            data_copy[mask_start:mask_start + mask_len] = 0
+    def time_masking(data, min_nonzero_ratio=0.8, max_mask_span=100):
+        if isinstance(data, torch.Tensor):
+            arr = data.cpu().numpy()
+            is_torch = True
         else:
-            mask_start = random.randint(0, data_copy.shape[0] - mask_len)
-            data_copy[mask_start:mask_start + mask_len] = 0
-        return data_copy
+            arr = data
+            is_torch = False
 
+        T = arr.shape[0]
+        max_mask_len = int(T * (1 - min_nonzero_ratio))
+        max_mask_len = max(5, min(max_mask_len, max_mask_span))  # 更灵活的限制
+        if max_mask_len < 1:
+            # 无需掩码
+            return data
+
+        mask_len = random.randint(1, max_mask_len)
+        start = random.randint(0, T - mask_len)
+        end = start + mask_len
+
+        out = arr.copy()
+        for c in range(arr.shape[1]):
+            # 插值前后端点
+            left_idx = start - 1
+            right_idx = end
+            if left_idx < 0 and right_idx >= T:
+                # 整列都被mask，跳过（返回原始）
+                continue
+            elif left_idx < 0:
+                out[start:end, c] = out[right_idx, c]
+            elif right_idx >= T:
+                out[start:end, c] = out[left_idx, c]
+            else:
+                # 线性插值
+                left_val = out[left_idx, c]
+                right_val = out[right_idx, c]
+                span = np.linspace(0, 1, mask_len, endpoint=False)
+                out[start:end, c] = left_val * (1 - span) + right_val * span
+
+        if is_torch:
+            return torch.from_numpy(out).to(data.dtype)
+        return out
     @staticmethod
-    def augment_data(data):
-        augmentation_methods = [
-            lambda x: x,
+    def scaling(data, min_scale=0.9, max_scale=1.1):
+        """按通道乘以小幅度因子，避免把数据变平"""
+        if isinstance(data, torch.Tensor):
+            arr = data.cpu().numpy()
+            is_torch = True
+        else:
+            arr = data
+            is_torch = False
+        scales = np.random.uniform(min_scale, max_scale, size=(1, arr.shape[1]))
+        out = arr * scales
+        if is_torch:
+            return torch.from_numpy(out).to(data.dtype)
+        return out
+    @staticmethod
+    def augment_data(data, allow_identity=False):
+        total_std = np.std(data) if not isinstance(data, torch.Tensor) else float(torch.std(data).item())
+        # 可用的方法（不包含恒等）
+        methods = [
             DataAugmentor.time_shifting,
             DataAugmentor.noise_injection,
             DataAugmentor.time_masking,
-            DataAugmentor.time_reversal
+            DataAugmentor.time_reversal,
+            DataAugmentor.scaling
         ]
-        method = random.choice(augmentation_methods)
-        return method(data)
+        if allow_identity:
+            methods.append(lambda x: x)
+
+        # 若原始方差极低，优先选择 noise 或 scaling，避免掩码导致更低方差
+        if total_std < 1e-5:
+            choice = random.choice([DataAugmentor.noise_injection, DataAugmentor.scaling, DataAugmentor.time_shifting])
+            return choice(data)
+        else:
+            choice = random.choice(methods)
+            return choice(data)
 
 def oversample_training_data(rows, augment_minority=True):
     label_counts = Counter([r['labels'] for r in rows])
@@ -86,6 +153,7 @@ def oversample_training_data(rows, augment_minority=True):
     print(f"过采样后类别分布: {dict(new_counts)}")
     print(f"总样本数: {len(augmented_data)} (原始: {len(rows)})")
     return augmented_data
+
 def prepare_and_balance_data(feature_path, split, feature_type, augment_train=True):
     feature_data = load_feature_pickle(feature_path, split)
     rows = prepare_rows_from_feature_data(feature_data, feature_type)
@@ -108,7 +176,7 @@ def prepare_and_balance_data(feature_path, split, feature_type, augment_train=Tr
     
     return rows
 
-def process_split(split_name, rows, out_dir, feature_path, region_map, global_edges, 
+def process_split(split_name, rows, out_dir, feature_path, region_map, 
                   k_intra, k_global, w1, w2, fs, device, batch_size, save_npy):
     out = {}
     adjs_dir = os.path.join(feature_path, 'adjs_precomputed')
@@ -124,25 +192,31 @@ def process_split(split_name, rows, out_dir, feature_path, region_map, global_ed
         ts_np = entry['data']
         label = entry['labels']
 
-        G_intra, _, _ = build_intra_region_view_mi(
-            ts_np, region_map, global_edges,
+        G_intra, _, n_windows = build_intra_region_view_mi(
+            ts_np, region_map,
             n_bins=16, strategy="uniform",
             window_size=400, stride=200
         )
-        print(f"G_intra: shape={G_intra.shape}, non-zero={np.count_nonzero(G_intra)}, mean={np.mean(G_intra):.6f}")                    
+        print(f"G_intra: shape={G_intra.shape}, non-zero={np.count_nonzero(G_intra)}, mean={np.mean(G_intra):.6f}, valid_windows={n_windows}")                    
+        
         S_global, _, _ = build_global_view(ts_np, w1=w1, w2=w2, fs=fs)
         print(f"S_global: shape={S_global.shape}, non-zero={np.count_nonzero(S_global)}, mean={np.mean(S_global):.6f}")
+        
         A_intra_sp = topk_sparsify_sym_row_normalize(G_intra, k_intra)
         print(f"A_intra_sp: non-zero={np.count_nonzero(A_intra_sp)}, mean={np.mean(A_intra_sp):.6f}")
+        
         A_global_sp = topk_sparsify_sym_row_normalize(S_global, k_global)
         print(f"A_global_sp: non-zero={np.count_nonzero(A_global_sp)}, mean={np.mean(A_global_sp):.6f}")
+        
         A_global_sp_t = torch.from_numpy(A_global_sp).float()
         edge_index, edge_weight = dense_to_sparse(A_global_sp_t)
         g = Data(edge_index=edge_index, num_nodes=A_global_sp.shape[0], edge_attr=edge_weight)
-        node_feats_np=compute_structure_encodings(g)
-        feature_mean=np.mean(node_feats_np)
-        feature_std=np.std(node_feats_np)
+        node_feats_np = compute_structure_encodings(g)
+        
+        feature_mean = np.mean(node_feats_np)
+        feature_std = np.std(node_feats_np)
         print(f"Sample {sid}: feature_mean={feature_mean:.6f}, feature_std={feature_std:.6f}")
+        
         if save_npy:
             np.save(os.path.join(adjs_dir, f"{sid}_intra.npy"), A_intra_sp.astype(np.float32))
             np.save(os.path.join(adjs_dir, f"{sid}_global.npy"), A_global_sp.astype(np.float32))
@@ -155,18 +229,17 @@ def process_split(split_name, rows, out_dir, feature_path, region_map, global_ed
             'A_intra': A_intra_sp.astype(np.float32),
             'A_global': A_global_sp.astype(np.float32),
         }
-    progress_bar.update(1)
+        progress_bar.update(1)
 
     progress_bar.close()
     return out
 
 
-def run_on_gpu(rank, args, all_rows, splits, region_map, global_edges):
+def run_on_gpu(rank, args, all_rows, splits, region_map):
     device = f'cuda:{rank}' if torch.cuda.is_available() else 'cpu'
     if device != 'cpu':
         torch.cuda.set_device(rank)
     print(f"Process {rank} is using {device}")
-
 
     results = {}
     for split in splits:
@@ -179,7 +252,7 @@ def run_on_gpu(rank, args, all_rows, splits, region_map, global_edges):
         if not part:
             continue
 
-        out_dict = process_split(split, part, args.out_dir, args.feature_path, region_map, global_edges,
+        out_dict = process_split(split, part, args.out_dir, args.feature_path, region_map,
                                  k_intra=args.k_intra, k_global=args.k_global,
                                  w1=args.w1, w2=args.w2, fs=args.fs, device=device,
                                  batch_size=args.batch_size, save_npy=args.save_npy)
@@ -205,15 +278,13 @@ def main():
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--nprocs', type=int, default=torch.cuda.device_count())
     parser.add_argument('--save_npy', type=bool, default=True, help='Save individual .npy files for each sample')
-    parser.add_argument('--global_edges_sample_size', type=int, default=200,
-                        help='Number of samples to use for global edges computation')
     args = parser.parse_args()
 
     splits = ['train', 'val', 'test']
     all_rows = {}
     for s in splits:
-        all_rows[s]  = prepare_and_balance_data(args.feature_path,s, args.feature_type)
-        print(f"{s}: {len(all_rows)} samples | label dist: {Counter([r['labels'] for r in all_rows[s]])}")
+        all_rows[s] = prepare_and_balance_data(args.feature_path, s, args.feature_type)
+        print(f"{s}: {len(all_rows[s])} samples | label dist: {Counter([r['labels'] for r in all_rows[s]])}")
 
     region_map_path = os.path.join(args.feature_path, 'region_map.npy')
     if os.path.exists(region_map_path):
@@ -225,28 +296,13 @@ def main():
         np.save(region_map_path, region_map)
         print("Saved region_map to", region_map_path)
 
-    global_edges_path = os.path.join(args.feature_path, 'global_edges.npy')
-    if os.path.exists(global_edges_path):
-        global_edges = np.load(global_edges_path, allow_pickle=True)
-        print("Loaded global_edges from", global_edges_path)
-    else:
-        # 使用抽样来计算 global_edges
-        train_list_full = [r['data'] for r in all_rows['train']]
-        sample_size = min(len(train_list_full), args.global_edges_sample_size)
-
-        indices = np.random.choice(len(train_list_full), size=sample_size, replace=False)
-        train_list_sample = [train_list_full[i] for i in indices]
-
-        global_edges = compute_global_edges(train_list_sample, n_bins=16, strategy="uniform")
-        np.save(global_edges_path, global_edges, allow_pickle=True)
-        print(f"Saved global_edges to {global_edges_path} using {sample_size} samples")
 
     safe_makedirs(args.out_dir)
 
     if args.nprocs > 1 and torch.cuda.is_available():
-        mp.spawn(run_on_gpu, nprocs=args.nprocs, args=(args, all_rows, splits, region_map, global_edges), join=True)
+        mp.spawn(run_on_gpu, nprocs=args.nprocs, args=(args, all_rows, splits, region_map), join=True)
     else:
-        run_on_gpu(0, args, all_rows, splits, region_map, global_edges)
+        run_on_gpu(0, args, all_rows, splits, region_map)
 
     merged_results = {s: {} for s in splits}
     merged_files = []
