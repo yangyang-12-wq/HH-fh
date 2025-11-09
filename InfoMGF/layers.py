@@ -13,11 +13,11 @@ class GCNConv_dense(nn.Module):
         self.linear.reset_parameters()
 
     def forward(self, input, A, sparse=False):
-        hidden = self.linear(input)
         if sparse:
-            output = torch.sparse.mm(A, hidden)
+            support = torch.sparse.mm(A, input)
         else:
-            output = torch.matmul(A, hidden)
+            support = torch.matmul(A, input)
+        output = self.linear(support)
         return output
 
 

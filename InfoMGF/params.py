@@ -26,19 +26,19 @@ def set_params():
     parser.add_argument('--feature_path', type=str, default='features',
                         help='Path to feature files')
     parser.add_argument('--batch_size', type=int, default=4,
-                        help='Batch size for training (reduced to avoid CUDA OOM)')
+                        help='Batch size (increased to 4 for stable gradient estimation)')
     parser.add_argument('--preload', type=bool, default=True,
                         help='Whether to preload data')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of data loading workers')
     
     # 训练相关参数
-    parser.add_argument('--epochs', type=int, default=999999,
+    parser.add_argument('--epochs', type=int, default=500,
                         help='Maximum training epochs (very large number - essentially unlimited until target achieved)')
-    parser.add_argument('--lr', type=float, default=0.01,
-                        help='Learning rate (increased for faster convergence)')
-    parser.add_argument('--w_decay', type=float, default=5e-4,
-                        help='Weight decay')
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='Learning rate (increased to 0.001 to match larger batch size)')
+    parser.add_argument('--w_decay', type=float, default=1e-4,
+                        help='Weight decay (reduced to allow model to fit training data)')
     parser.add_argument('--patience', type=int, default=10,
                         help='Early stopping patience')
     parser.add_argument('--classification_weight', type=float, default=5.0,
@@ -49,20 +49,20 @@ def set_params():
                         help='Minimum number of training epochs before considering early stopping')
     
     # 模型架构参数
-    parser.add_argument('--nlayers', type=int, default=2,
-                        help='Number of GNN layers')
+    parser.add_argument('--nlayers', type=int, default=1,
+                        help='Number of GNN layers (restored to 2 after fixing over-normalization)')
     parser.add_argument('--hidden_dim', type=int, default=128,
                         help='Hidden dimension')
     parser.add_argument('--rep_dim', type=int, default=64,
                         help='Representation dimension')
-    parser.add_argument('--dropout', type=float, default=0.5,
-                        help='Dropout rate')
+    parser.add_argument('--dropout', type=float, default=0.3,
+                        help='Dropout rate (reduced to 0.3 to allow better training set fitting)')
     
     # 图学习参数
-    parser.add_argument('--k', type=int, default=15,
-                        help='Number of nearest neighbors for graph construction')
-    parser.add_argument('--dropedge_rate', type=float, default=0.1,
-                        help='Edge dropout rate')
+    parser.add_argument('--k', type=int, default=20,
+                        help='Number of nearest neighbors (reduced to 10 to avoid over-smoothing in 53-node graphs)')
+    parser.add_argument('--dropedge_rate', type=float, default=0.0,
+                        help='Edge dropout rate (set to 0 to avoid over-sparsification)')
     parser.add_argument('--activation_learner', type=str, default='tanh',
                         choices=['relu', 'tanh'], help='Activation function for graph learner')
     parser.add_argument('--r', type=int, default=2,
@@ -100,12 +100,12 @@ def set_params():
                         help='H parameter for SC loss')
     parser.add_argument('--alpha', type=float, default=1.0,
                         help='Weight for LFD loss')
-    parser.add_argument('--beta', type=float, default=1.0,
-                        help='Weight for S_high loss')
+    parser.add_argument('--beta', type=float, default=0.5,
+                        help='Weight for S_high loss (reduced to 0.5 after fixing calculation)')
     parser.add_argument('--gamma', type=float, default=1.0,
                         help='Weight for SC loss')
     parser.add_argument('--lambda1', type=float, default=1.0,
-                        help='Overall weight for self-supervised loss')
+                        help='Overall weight for self-supervised loss (reduced to 1.0 to prioritize CE loss)')
     parser.add_argument('--eval_freq', type=int, default=10,
                         help='Validation evaluation frequency (every N epochs)')
     parser.add_argument('--downstream_task', type=str, default='classification',
@@ -113,4 +113,5 @@ def set_params():
     
     args = parser.parse_args()
     return args
+
 

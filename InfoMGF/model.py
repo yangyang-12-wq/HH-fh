@@ -104,7 +104,7 @@ class GraphEncoder(nn.Module):
         super(GraphEncoder, self).__init__()
         self.dropout = dropout
         self.gnn_encoder_layers = nn.ModuleList()
-        self.act = nn.ReLU()
+        self.act = nn.LeakyReLU(0.2) 
         self.num_g = 2  
         if sparse:
             self.gnn_encoder_layers.append(GCNConv_dgl(in_dim, hidden_dim))
@@ -119,14 +119,14 @@ class GraphEncoder(nn.Module):
         self.sparse = sparse
 
     def forward(self, x, Adj):
-
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        for conv in self.gnn_encoder_layers[:-1]:
-            x = conv(x, Adj)
-            x = self.act(x)
+        initial_x = x
+        for i, conv in enumerate(self.gnn_encoder_layers):
             x = F.dropout(x, p=self.dropout, training=self.training)
-
-        x = self.gnn_encoder_layers[-1](x, Adj)
+            x = conv(x, Adj)
+            if i < len(self.gnn_encoder_layers) - 1:
+                x = self.act(x)
+                if x.shape == initial_x.shape:
+                    x = x + initial_x
         return x
     def cal_custom_loss(self, z_specific_adjs, z_fused_adj, specific_adjs, 
                        temperature=1.0, h=1.0, alpha=1.0, beta=1.0, gamma=1.0):
@@ -144,14 +144,22 @@ class GraphEncoder(nn.Module):
             lfd_loss_total += lfd_loss
         lfd_loss_avg = lfd_loss_total / self.num_g
         
-        s_high_values=[]
+        # 2. S_High损失: 鼓励每个view在自己的图上保持平滑性（低高频能量）
+        s_high_same = [] 
+        s_high_cross = [] 
+        
         for i in range(self.num_g):
+            s_high_same.append(compute_s_high(z_specific_adjs[i], specific_adjs[i]))
+        
             for j in range(self.num_g):
-                if i==j:
-                    continue
-                s_high_value=compute_s_high(z_specific_adjs[i],specific_adjs[j])
-                s_high_values.append(s_high_value)
-        s_high_loss_avg=torch.abs(s_high_values[0]-s_high_values[1])
+                if i != j:
+                    s_high_cross.append(compute_s_high(z_specific_adjs[i], specific_adjs[j]))
+
+        s_high_same_avg = torch.stack(s_high_same).mean()
+        s_high_cross_avg = torch.stack(s_high_cross).mean()
+       
+        s_high_loss_avg = torch.clamp(s_high_same_avg - s_high_cross_avg + 1.0, min=0.0)
+        
         # 3. SC损失: 不同视图间的分布相似性
         sc_loss_total = 0
         count = 0
@@ -195,10 +203,16 @@ class GraphEncoderWithPooling(nn.Module):
 class GraphClassifierHead(torch.nn.Module):
     def __init__(self, in_dim, nclasses):
         super().__init__()
-        self.linear = torch.nn.Linear(in_dim, nclasses)
+        self.linear = nn.Linear(in_dim, nclasses)
+        
+        nn.init.xavier_uniform_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)  
+    
     def forward(self, graph_emb):
-        return self.linear(graph_emb)
-#用在最开始的图上  SGC
+        graph_emb = F.normalize(graph_emb, p=2, dim=1)
+        logits = self.linear(graph_emb)
+        return logits
+
 def AGG(h_list, adjs_o, nlayer, sparse=False):
     f_list = []
     for i in range(len(adjs_o)):
@@ -209,7 +223,6 @@ def AGG(h_list, adjs_o, nlayer, sparse=False):
                 z = torch.sparse.mm(adj, z)
             else:
                 z = torch.matmul(adj, z)
-        z = F.normalize(z, dim=1, p=2)
         f_list.append(z)
 
     return f_list
