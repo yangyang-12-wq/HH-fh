@@ -372,6 +372,7 @@ class Experiment:
                     
                     
                     if batch_idx % 50 == 0:
+
                         print(f"\n[Feature Stats at batch {batch_idx}]")
                         batch_size = len(torch.unique(node2graph))
                         print(f"Batch info: {batch_size} graphs, {N} total nodes")
@@ -471,6 +472,7 @@ class Experiment:
                         train_correct += (preds == batch.y.view(-1)).sum().item()
                         train_total += batch.y.size(0)
                     if batch_idx % 50 == 0:
+                        grad_norms = {}
                         current_batch_acc = train_correct / train_total if train_total > 0 else 0.0
                         print(f'Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}, Train Acc so far: {current_batch_acc:.4f}')
                         
