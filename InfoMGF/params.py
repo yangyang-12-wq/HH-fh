@@ -11,7 +11,7 @@ def set_params():
                         help='Dataset name')
     parser.add_argument('--dataset_name', type=str, default='fnirs_exp',
                         help='Dataset name for experiment tracking')
-    parser.add_argument('--gpu', type=int, default=0,
+    parser.add_argument('--gpu', type=int, default=6,
                         help='GPU device number (used when multi_gpu=False)')
     parser.add_argument('--multi_gpu', type=bool, default=True,
                         help='Whether to use multiple GPUs with DataParallel')
@@ -33,30 +33,31 @@ def set_params():
                         help='Number of data loading workers')
     
     # 训练相关参数
-    parser.add_argument('--epochs', type=int, default=500,
-                        help='Maximum training epochs (very large number - essentially unlimited until target achieved)')
+    parser.add_argument('--epochs', type=int, default=1000,
+                        help='Maximum training epochs (reduced to 500 to prevent overfitting)')
     parser.add_argument('--lr', type=float, default=0.001,
-                        help='Learning rate (increased to 0.001 to match larger batch size)')
+                        help='Learning rate (increased for better convergence)')
     parser.add_argument('--w_decay', type=float, default=1e-4,
-                        help='Weight decay (reduced to allow model to fit training data)')
-    parser.add_argument('--patience', type=int, default=10,
-                        help='Early stopping patience')
+                        help='Weight decay (increased to 5e-4 for stronger regularization)')
+    parser.add_argument('--patience', type=int, default=50,
+                        help='Early stopping patience (increased to allow more exploration)')
     parser.add_argument('--classification_weight', type=float, default=5.0,
                         help='Weight multiplier for classification loss')
     parser.add_argument('--min_ce_loss_threshold', type=float, default=0.3,
                         help='Minimum CE loss threshold before allowing early stopping (relaxed from 0.05 to be more achievable)')
     parser.add_argument('--min_training_epochs', type=int, default=30,
                         help='Minimum number of training epochs before considering early stopping')
+ 
     
     # 模型架构参数
-    parser.add_argument('--nlayers', type=int, default=1,
+    parser.add_argument('--nlayers', type=int, default=2,
                         help='Number of GNN layers (restored to 2 after fixing over-normalization)')
     parser.add_argument('--hidden_dim', type=int, default=128,
-                        help='Hidden dimension')
+                        help='Hidden dimension (reduced to 32 to combat overfitting)')
     parser.add_argument('--rep_dim', type=int, default=64,
                         help='Representation dimension')
     parser.add_argument('--dropout', type=float, default=0.3,
-                        help='Dropout rate (reduced to 0.3 to allow better training set fitting)')
+                        help='Dropout rate (balanced regularization)')
     
     # 图学习参数
     parser.add_argument('--k', type=int, default=20,
@@ -67,24 +68,8 @@ def set_params():
                         choices=['relu', 'tanh'], help='Activation function for graph learner')
     parser.add_argument('--r', type=int, default=2,
                         help='Number of AGG layers')
+  
     
-    # 重新平衡的损失权重参数 (基于实际损失值的数量级计算)
-    parser.add_argument('--lambda_smooth', type=float, default=1000.0,
-                        help='Weight for graph smoothness loss (λ ≈ 0.5/0.0003 ≈ 1666, rounded to 1000)')
-    parser.add_argument('--lambda_consistency', type=float, default=25.0,
-                        help='Weight for multi-view consistency loss (increased from 15 to 25 for better balance)')
-    parser.add_argument('--lambda_distill', type=float, default=0.01,
-                        help='Weight for distillation loss (may be replaced by L_LFD)')
-    parser.add_argument('--lambda_lfd', type=float, default=1000.0,
-                        help='Weight for LFD/Dirichlet energy loss (λ ≈ 0.5/0.0006 ≈ 833, rounded to 1000)')
-    parser.add_argument('--temperature', type=float, default=0.5,
-                        help='Temperature parameter for graph learning sparsity control (lower = sparser graphs)')
-    parser.add_argument('--loss_topk', type=int, default=10,
-                        help='Top-k neighbors to keep when computing graph-based losses')
-    
-    # 模型保存参数
-    parser.add_argument('--model_save_path', type=str, default='best_model.pth',
-                        help='Path to save the best model')
     # 在 params.py 中添加缺失的参数
     parser.add_argument('--sparse', type=bool, default=False, 
                         help='Whether to use sparse graph representation')
@@ -93,25 +78,60 @@ def set_params():
     parser.add_argument('--nlayer_gnn', type=int, default=2,
                         help='Number of GNN encoder layers')
     parser.add_argument('--emb_dim', type=int, default=64,
-                        help='Embedding dimension')
+                        help='Embedding dimension (reduced to 32 to combat overfitting)')
     parser.add_argument('--tau', type=float, default=1.0,
                         help='Temperature parameter for custom loss')
     parser.add_argument('--h', type=float, default=1.0,
                         help='H parameter for SC loss')
-    parser.add_argument('--alpha', type=float, default=1.0,
-                        help='Weight for LFD loss')
+    parser.add_argument('--alpha', type=float, default=0.5,
+                        help='Weight for LFD loss (reduced to focus more on classification)')
     parser.add_argument('--beta', type=float, default=0.5,
-                        help='Weight for S_high loss (reduced to 0.5 after fixing calculation)')
+                        help='Weight for S_high loss (reduced to avoid over-regularization)')
     parser.add_argument('--gamma', type=float, default=1.0,
-                        help='Weight for SC loss')
+                        help='Weight for SC loss (reduced to focus on classification)')
     parser.add_argument('--lambda1', type=float, default=1.0,
-                        help='Overall weight for self-supervised loss (reduced to 1.0 to prioritize CE loss)')
+                        help='Overall weight for self-supervised loss (drastically reduced from 0.8 to 0.1 to prioritize classification)')
+    # parser.add_argument('--lambda_att', type=float, default=0.05,
+    #                     help='Weight for attention balance loss in full loss mode (reduced)')
+    # parser.add_argument('--lambda_view', type=float, default=0.05,
+    #                     help='Weight for view diversity loss in full loss mode (reduced)')
     parser.add_argument('--eval_freq', type=int, default=10,
                         help='Validation evaluation frequency (every N epochs)')
     parser.add_argument('--downstream_task', type=str, default='classification',
                         help='Downstream task type')
+
+    parser.add_argument('--scheduler_patience', type=int, default=30,
+                        help='ReduceLROnPlateau patience (eval steps) - reduced for faster adaptation')
+    parser.add_argument('--lr_schedule', type=str, default='plateau',
+                        choices=['plateau', 'cosine'],
+                        help='Learning rate schedule: plateau (ReduceLROnPlateau) or cosine (warmup+cosine)')
+    parser.add_argument('--warmup_epochs', type=int, default=70,
+                        help='Warmup epochs before cosine annealing (only when lr_schedule=cosine)')
+    parser.add_argument('--min_lr', type=float, default=1e-5,
+                        help='Minimum learning rate for cosine annealing')
+   
+  
+    parser.add_argument('--label_mode', type=str, default='binary',
+                        choices=['multi', 'binary'],
+                        help='How to load labels: multi-class or binary (0 vs others)')
     
+    # 损失函数模式
+    parser.add_argument('--loss_mode', type=str, default='ce_only',
+                        choices=['full', 'ce_only'],
+                        help='Loss mode: full (all losses) or ce_only (classification loss only) - DEFAULT ce_only for stability')
+    parser.add_argument('--smart_resample', type=bool, default=True,
+                        help='Whether to apply smart resampling for binary classification (train set only) - DEFAULT False to check raw data')
+    parser.add_argument('--use_original_only', action='store_true',
+                        help='Use only original samples, filtering out all _aug augmented samples (train only). Default: False (includes augmented samples).')
+    parser.add_argument('--balance_strategy', type=str, default='downsample_class1',
+                        choices=['upsample_class0', 'downsample_class1'],
+                        help='Strategy for balancing classes: upsample_class0 (increase Class 0) or downsample_class1 (proportionally sample Class 1)')
+    parser.add_argument('--attention_use_layer_norm', type=bool, default=True,
+                    help='Whether to apply LayerNorm inside the attention fusion module')
+    
+   
     args = parser.parse_args()
     return args
+
 
 

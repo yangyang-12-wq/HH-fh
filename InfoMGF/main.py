@@ -23,28 +23,42 @@ EOS = 1e-10
 args = set_params()
 def quick_diagnose(logits, batch, model_modules, optimizer, criterion, attention_weights=None, graph_emb=None, 
                    attention_balance_loss=None, view_diversity_loss=None):
-    preds = logits.argmax(dim=1)
-    print("\n" + "="*50)
-    print("Pred distribution:", torch.bincount(preds).cpu().numpy())
-    print("Label distribution:", torch.bincount(batch.y.view(-1)).cpu().numpy())
-    
-    
-    probs = F.softmax(logits, dim=1)
-    class_conf = probs.mean(dim=0).detach().cpu().numpy()
-    print(f"Avg pred confidence per class: {[f'{c:.3f}' for c in class_conf]} (should be ~0.2 for 5 classes)")
-    print("Logits stats mean/std/min/max:", float(logits.mean().item()), float(logits.std().item()),
-          float(logits.min().item()), float(logits.max().item()))
-    
-    # 分析每个类别的logits
-    print("Logits per class:")
-    for i in range(logits.shape[1]):
-        class_logits = logits[:, i]
-        print(f"  Class {i}: mean={class_logits.mean().item():.4f}, std={class_logits.std().item():.4f}")
+    # Support both multi-class and binary (single-logit) cases
+    if logits.dim() == 2 and logits.size(1) > 1:
+        preds = logits.argmax(dim=1)
+        print("\n" + "="*50)
+        print("Pred distribution:", torch.bincount(preds).cpu().numpy())
+        print("Label distribution:", torch.bincount(batch.y.view(-1)).cpu().numpy())
+        probs = F.softmax(logits, dim=1)
+        class_conf = probs.mean(dim=0).detach().cpu().numpy()
+        print(f"Avg pred confidence per class: {[f'{c:.3f}' for c in class_conf]}")
+        print("Logits stats mean/std/min/max:", float(logits.mean().item()), float(logits.std().item()),
+              float(logits.min().item()), float(logits.max().item()))
+        print("Logits per class:")
+        for i in range(logits.shape[1]):
+            class_logits = logits[:, i]
+            print(f"  Class {i}: mean={class_logits.mean().item():.4f}, std={class_logits.std().item():.4f}")
+    else:
+        probs_pos = torch.sigmoid(logits.view(-1))
+        preds = (probs_pos > 0.5).long()
+        print("\n" + "="*50)
+        print("Pred distribution:", torch.bincount(preds).cpu().numpy())
+        print("Label distribution:", torch.bincount(batch.y.view(-1)).cpu().numpy())
+        print(f"Avg positive probability: {probs_pos.mean().item():.3f}")
+        print("Logits stats mean/std/min/max:", float(logits.mean().item()), float(logits.std().item()),
+              float(logits.min().item()), float(logits.max().item()))
     
     per_sample_std = logits.std(dim=1)
     print("Per-sample logits std mean:", float(per_sample_std.mean().item()),
           "frac zero-std:", float((per_sample_std==0).float().mean().item()))
-    loss_val = criterion(logits, batch.y.view(-1))
+    # Compute criterion loss preview with correct shapes/types
+    try:
+        if logits.dim() == 2 and logits.size(1) > 1:
+            loss_val = criterion(logits, batch.y.view(-1))
+        else:
+            loss_val = F.binary_cross_entropy_with_logits(logits.view(-1), batch.y.float())
+    except Exception as e:
+        loss_val = torch.tensor(float('nan'))
     print("Loss value:", float(loss_val.item()))
     
     # 分析图嵌入的区分度
@@ -215,18 +229,34 @@ class Experiment:
              
                 graph_emb = global_mean_pool(fused_z, node2graph)
                 logits = classifier(graph_emb)
-                probs = F.softmax(logits, dim=1)
-                loss = F.cross_entropy(logits, batch.y.view(-1))
+                if n_classes is None:
+                    if logits.dim() == 2 and logits.size(1) > 1:
+                        n_classes = logits.size(1)
+                    else:
+                        n_classes = 2
+                if n_classes == 2 and (logits.dim() == 1 or logits.size(1) == 1):
+                    # Binary: single-logit
+                    loss = F.binary_cross_entropy_with_logits(logits.view(-1), batch.y.float())
+                    prob_pos = torch.sigmoid(logits.view(-1))
+                    preds = (prob_pos > 0.5).long().cpu().numpy()
+                    probs_np = prob_pos.detach().cpu().numpy()
+                    probs_2col = np.stack([1.0 - probs_np, probs_np], axis=1)
+                    all_probs.extend(probs_2col)
+                else:
+                    probs = F.softmax(logits, dim=1)
+                    loss = F.cross_entropy(logits, batch.y.view(-1))
+                    preds = torch.argmax(logits, dim=1).cpu().numpy()
+                    all_probs.extend(probs.cpu().numpy())
                 
                 total_loss += float(loss.item())
                 nb += 1
-                preds = torch.argmax(logits, dim=1).cpu().numpy()
                 all_preds.extend(preds.tolist())
                 all_labels.extend(batch.y.cpu().numpy().reshape(-1).tolist())
-                all_probs.extend(probs.cpu().numpy())
                 
-                if n_classes is None:
-                    n_classes = logits.shape[1]
+                
+                all_preds.extend(preds.tolist())
+                all_labels.extend(batch.y.cpu().numpy().reshape(-1).tolist())
+                
         
         if nb == 0:
             return 0.0, 0.0, 0.0, 0.0
@@ -236,19 +266,7 @@ class Experiment:
         detailed_metrics = self.callculate_detailed(all_labels, all_preds, all_probs, n_classes, trial, split, log_file=log_file, epoch=epoch)
         
         return avg_loss, detailed_metrics
-    def calculate_class_weights(self, dataset):
-        labels = []
-        for data in dataset:
-            labels.append(data.y.item())
-        class_counts = np.bincount(labels)
-        n_classes = len(class_counts)
-        
-        weights = len(labels) / (n_classes * class_counts)
-        weights = torch.tensor(weights, dtype=torch.float32)
-        print(f"Class counts: {class_counts}")
-        print(f"Class weights: {weights}")
-        return weights
-  
+
 
     def train(self, args):
         print(args)
@@ -270,12 +288,11 @@ class Experiment:
         results_log.flush()
         print(f"Results will be saved to: {results_log_path}")
     
-        data_root='../../../processed_data1'
-        train_dataset=BrainGraphDataset(root=data_root, split='train')
-        val_dataset=BrainGraphDataset(root=data_root, split='val')
-        test_dataset=BrainGraphDataset(root=data_root, split='test')
+        data_root='../../../processed_fnirs/processed_data1'
+        train_dataset=BrainGraphDataset(root=data_root, split='train',label_mode=args.label_mode)
+        val_dataset=BrainGraphDataset(root=data_root, split='val',label_mode=args.label_mode)
+        test_dataset=BrainGraphDataset(root=data_root, split='test',label_mode=args.label_mode)
     
-        criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.05)
         train_loader=DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
         val_loader=DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
         test_loader=DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
@@ -287,313 +304,331 @@ class Experiment:
             nclasses=0
         print(f"Number of features: {nfeats}")
         print(f"Number of classes: {nclasses}")
+        if nclasses == 2:
+            criterion = torch.nn.CrossEntropyLoss()
+        else:
+            criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.05)
         num_views=2
      
         test_results = []
         val_results = []
 
   
-
-        for trial in range(args.ntrials):
-
-            self.setup_seed(trial)
-            trial_log_dir = f"{log_dir}/trial_{trial}"
-            trial_writer = SummaryWriter(log_dir=trial_log_dir)
-            specific_graph_learner = GraphLearnerGCN(gcn_input_dim=nfeats,
-                gcn_hidden_dim=args.hidden_dim,
-                gcn_output_dim=args.emb_dim,
-                k=args.k,
-                dropedge_rate=args.dropedge_rate,
-                sparse=args.sparse,
-                act=args.activation_learner) 
-            attention_fusion=AttentionFusion(input_dim=args.emb_dim, num_views=num_views)
-            encoder=GraphEncoder(nlayers=args.nlayer_gnn, in_dim=nfeats, hidden_dim=args.hidden_dim, emb_dim=args.emb_dim, dropout=args.dropout, sparse=args.sparse)
-            classifier=GraphClassifierHead(in_dim=args.emb_dim,nclasses=nclasses)
-            encoder = encoder.to(device)
-            classifier = classifier.to(device)
-            specific_graph_learner = specific_graph_learner.to(device)
-            attention_fusion = attention_fusion.to(device)
-            params = []
-            params.append({'params': specific_graph_learner.parameters()})
-            params.append({'params': encoder.parameters()})
-            params.append({'params': classifier.parameters()})
-            params.append({'params': attention_fusion.parameters()})
-            optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.w_decay)
+        trial = 0
+        self.setup_seed(trial)
+        trial_log_dir = f"{log_dir}/trial_{trial}"
+        trial_writer = SummaryWriter(log_dir=trial_log_dir)
+        specific_graph_learner = GraphLearnerGCN(gcn_input_dim=nfeats,
+            gcn_hidden_dim=args.hidden_dim,
+            gcn_output_dim=args.emb_dim,
+            k=args.k,
+            dropedge_rate=args.dropedge_rate,
+            sparse=args.sparse,
+            act=args.activation_learner) 
+        attention_fusion=AttentionFusion(input_dim=args.emb_dim, num_views=num_views)
+        encoder=GraphEncoder(nlayers=args.nlayer_gnn, in_dim=nfeats, hidden_dim=args.hidden_dim, emb_dim=args.emb_dim, dropout=args.dropout, sparse=args.sparse)
+        classifier=GraphClassifierHead(in_dim=args.emb_dim,nclasses=nclasses)
+        encoder = encoder.to(device)
+        classifier = classifier.to(device)
+        specific_graph_learner = specific_graph_learner.to(device)
+        attention_fusion = attention_fusion.to(device)
+        params = []
+        params.append({'params': specific_graph_learner.parameters()})
+        params.append({'params': encoder.parameters()})
+        params.append({'params': classifier.parameters()})
+        params.append({'params': attention_fusion.parameters()})
+        optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.w_decay)
+        if args.lr_schedule == 'cosine':
+            total_epochs = max(1, args.epochs)
+            warmup_epochs = max(0, min(args.warmup_epochs, total_epochs))
+            if warmup_epochs > 0:
+                warmup = LambdaLR(optimizer, lr_lambda=lambda e: (e + 1) / float(warmup_epochs))
+            else:
+                warmup = LambdaLR(optimizer, lr_lambda=lambda e: 1.0)
+            cosine = CosineAnnealingLR(optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=args.min_lr)
+            scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
+            lr_mode = 'cosine'
+        else:
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='max', factor=0.7, patience=20, verbose=True, min_lr=1e-5
-            )  
-            best_val = -1.0
-            best_state = None
-            best_val_metrics=None
-            patience_counter = 0
-            early_stop_patience = 15  
-            epoch_losses = {
-                'total': [],
-                'supervised': [],
-                'self_supervised': [],
-                'lfd': [],
-                's_high': [],
-                'sc': [],
-                'train_acc': []  
-            }
-            model_modules = {'learner': specific_graph_learner, 'encoder': encoder, 'fusion': attention_fusion, 'classifier': classifier}
-            torch.autograd.set_detect_anomaly(True) 
-            for epoch in range(1, args.epochs + 1):
-                encoder.train()
-                classifier.train()
-                specific_graph_learner.train()
-                attention_fusion.train()
-                total_loss = 0.0
-                train_correct = 0  
-                train_total = 0    
-                total_sup_loss = 0.0
-                total_self_loss = 0.0
-                total_lfd_loss = 0.0
-                total_s_high_loss = 0.0
-                total_sc_loss = 0.0
-                n_batches = 0
-                for batch_idx, batch in enumerate(train_loader):
-                    batch = batch.to(device)
-                    adj_list,node2graph,N=build_adjs_from_batch(batch, device)
-                    feat=batch.x
-                    view_features = AGG([feat for _ in range(len(adj_list))], adj_list, args.r, sparse=args.sparse)
-        
-                    learned_specific_adjs = []
-                    z_specifics=[]
-                    for i in range(len(adj_list)):
-                       
-                        learned_adj = specific_graph_learner.graph_process(view_features[i], batch=node2graph)
-                        learned_specific_adjs.append(learned_adj)
-        
-                        emb = specific_graph_learner(view_features[i], learned_adj)
-                       
-                        emb = F.normalize(emb, p=2, dim=1)
-                        z_specifics.append(emb)
-                    
-                    
-                    if batch_idx % 50 == 0:
+                optimizer, mode='max', factor=0.7, patience=args.scheduler_patience, verbose=True, min_lr=1e-5
+            )
+            lr_mode = 'plateau'
+        best_val = -1.0
+        best_state = None
+        best_val_metrics=None
 
-                        print(f"\n[Feature Stats at batch {batch_idx}]")
-                        batch_size = len(torch.unique(node2graph))
-                        print(f"Batch info: {batch_size} graphs, {N} total nodes")
+        epoch_losses = {
+            'total': [],
+            'supervised': [],
+            'self_supervised': [],
+            'lfd': [],
+            's_high': [],
+            'sc': [],
+            'train_acc': []  
+        }
+        model_modules = {'learner': specific_graph_learner, 'encoder': encoder, 'fusion': attention_fusion, 'classifier': classifier}
+        torch.autograd.set_detect_anomaly(True) 
+        for epoch in range(1, args.epochs + 1):
+            encoder.train()
+            classifier.train()
+            specific_graph_learner.train()
+            attention_fusion.train()
+            total_loss = 0.0
+            train_correct = 0  
+            train_total = 0    
+            total_sup_loss = 0.0
+            total_self_loss = 0.0
+            total_lfd_loss = 0.0
+            total_s_high_loss = 0.0
+            total_sc_loss = 0.0
+            n_batches = 0
+            for batch_idx, batch in enumerate(train_loader):
+                batch = batch.to(device)
+                adj_list,node2graph,N=build_adjs_from_batch(batch, device)
+                feat=batch.x
+                view_features = AGG([feat for _ in range(len(adj_list))], adj_list, args.r, sparse=args.sparse)
+    
+                learned_specific_adjs = []
+                z_specifics=[]
+                for i in range(len(adj_list)):
+                    
+                    learned_adj = specific_graph_learner.graph_process(view_features[i], batch=node2graph)
+                    learned_specific_adjs.append(learned_adj)
+    
+                    emb = specific_graph_learner(view_features[i], learned_adj)
+                    
+                    emb = F.normalize(emb, p=2, dim=1)
+                    z_specifics.append(emb)
+                
+                
+                if batch_idx % 50 == 0:
+
+                    print(f"\n[Feature Stats at batch {batch_idx}]")
+                    batch_size = len(torch.unique(node2graph))
+                    print(f"Batch info: {batch_size} graphs, {N} total nodes")
+                    for g in range(batch_size):
+                        n_nodes_in_g = (node2graph == g).sum().item()
+                        print(f"  Graph {g}: {n_nodes_in_g} nodes")
+                    print(f"Original feat: mean={feat.mean().item():.4f}, std={feat.std().item():.4f}")
+                    for i, vf in enumerate(view_features):
+                        print(f"View {i} features: mean={vf.mean().item():.4f}, std={vf.std().item():.4f}")
+                    for i, zs in enumerate(z_specifics):
+                        print(f"Z_specific {i}: mean={zs.mean().item():.4f}, std={zs.std().item():.4f}")
+                    
+                    
+                    la = learned_specific_adjs[0]
+                    print(f"Learned_adj: nnz={la.sum().item():.0f}, density={la.sum().item()/(N*N)*100:.2f}%")
+                    
+                    
+                    batch_size = len(torch.unique(node2graph))
+                    if batch_size > 1:
+                        within_sum = 0.0
+                        cross_sum = 0.0
                         for g in range(batch_size):
-                            n_nodes_in_g = (node2graph == g).sum().item()
-                            print(f"  Graph {g}: {n_nodes_in_g} nodes")
-                        print(f"Original feat: mean={feat.mean().item():.4f}, std={feat.std().item():.4f}")
-                        for i, vf in enumerate(view_features):
-                            print(f"View {i} features: mean={vf.mean().item():.4f}, std={vf.std().item():.4f}")
-                        for i, zs in enumerate(z_specifics):
-                            print(f"Z_specific {i}: mean={zs.mean().item():.4f}, std={zs.std().item():.4f}")
-                        
-                        
-                        la = learned_specific_adjs[0]
-                        print(f"Learned_adj: nnz={la.sum().item():.0f}, density={la.sum().item()/(N*N)*100:.2f}%")
-                        
-                        
-                        batch_size = len(torch.unique(node2graph))
-                        if batch_size > 1:
-                            within_sum = 0.0
-                            cross_sum = 0.0
-                            for g in range(batch_size):
-                                mask_g = (node2graph == g)
-                                within_block = la[mask_g][:, mask_g]
-                                within_sum += within_block.sum().item()
-                                for g2 in range(batch_size):
-                                    if g != g2:
-                                        mask_g2 = (node2graph == g2)
-                                        cross_block = la[mask_g][:, mask_g2]
-                                        cross_sum += cross_block.sum().item()
-                            print(f"  Within-graph connections: {within_sum:.2f}")
-                            print(f"  Cross-graph connections: {cross_sum:.6f} (should be ~0)")
-                            if cross_sum > 1e-6:
-                                print(f"   WARNING: Cross-graph connections detected!")
+                            mask_g = (node2graph == g)
+                            within_block = la[mask_g][:, mask_g]
+                            within_sum += within_block.sum().item()
+                            for g2 in range(batch_size):
+                                if g != g2:
+                                    mask_g2 = (node2graph == g2)
+                                    cross_block = la[mask_g][:, mask_g2]
+                                    cross_sum += cross_block.sum().item()
+                        print(f"  Within-graph connections: {within_sum:.2f}")
+                        print(f"  Cross-graph connections: {cross_sum:.6f} (should be ~0)")
+                        if cross_sum > 1e-6:
+                            print(f"   WARNING: Cross-graph connections detected!")
 
+                
+                sparse_specific_adjs = []
+                for adj_sp in learned_specific_adjs:
                     
-                    sparse_specific_adjs = []
-                    for adj_sp in learned_specific_adjs:
-                       
-                        sp = adj_to_sparse_coo(adj_sp, N, device) 
-                        sparse_specific_adjs.append(sp)  
-                    fused_z,attention_weights = attention_fusion(z_specifics, batch=node2graph)
-                   
-                    graph_emb = global_mean_pool(fused_z, node2graph)
-                    logits = classifier(graph_emb)
-                    if torch.isnan(logits).any() or torch.isinf(logits).any():
-                        print(f"Epoch {epoch} Batch {batch_idx}: Invalid logits detected")
-                        continue
-                    
-                   
+                    sp = adj_to_sparse_coo(adj_sp, N, device) 
+                    sparse_specific_adjs.append(sp)  
+                fused_z,attention_weights = attention_fusion(z_specifics, batch=node2graph)
+                
+                graph_emb = global_mean_pool(fused_z, node2graph)
+                logits = classifier(graph_emb)
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    print(f"Epoch {epoch} Batch {batch_idx}: Invalid logits detected")
+                    continue
+                
+                if nclasses == 2 and (logits.size(1) == 1 or logits.dim()==1):
+                    loss_sup = F.binary_cross_entropy_with_logits(logits.view(-1), batch.y.float())
+                else:
                     loss_sup = criterion(logits, batch.y.view(-1))
-                    
-                   
-                    attention_entropy = -(attention_weights * torch.log(attention_weights + 1e-8)).sum(dim=1).mean()
-                    max_entropy = torch.log(torch.tensor(float(attention_weights.size(1)), device=attention_weights.device))
-                    attention_balance_loss = (max_entropy - attention_entropy) 
-                    
-                    
-                    view_graph_embs = []
-                    for z in z_specifics:
-                        view_graph_emb = global_mean_pool(z, node2graph)  # [batch_size, dim]
-                        view_graph_emb = F.normalize(view_graph_emb, p=2, dim=1)
-                        view_graph_embs.append(view_graph_emb)
-                    
                 
-                    view_similarity = (view_graph_embs[0] * view_graph_embs[1]).sum(dim=1).abs().mean()
-                    view_diversity_loss = view_similarity  
-                    
-                    loss_self,loss_details=encoder.cal_custom_loss(z_specifics,fused_z,learned_specific_adjs
-                                                                  ,args.tau,args.h,args.alpha,args.beta,args.gamma)
-                    
-                    
-                    loss = loss_sup + args.lambda1 * loss_self + 0.05 * attention_balance_loss + 0.02 * view_diversity_loss 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=5.0)
-                    torch.nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=5.0)
-                    torch.nn.utils.clip_grad_norm_(specific_graph_learner.parameters(), max_norm=5.0)
-                    torch.nn.utils.clip_grad_norm_(attention_fusion.parameters(), max_norm=5.0)
-                    if batch_idx % 50 == 0:
-                        preds = quick_diagnose(logits, batch, model_modules, optimizer, criterion, attention_weights, graph_emb,
-                                             attention_balance_loss, view_diversity_loss)
+                
+                # attention_entropy = -(attention_weights * torch.log(attention_weights + 1e-8)).sum(dim=1).mean()
+                # max_entropy = torch.log(torch.tensor(float(attention_weights.size(1)), device=attention_weights.device))
+                # attention_balance_loss = (max_entropy - attention_entropy) 
+                
+                
+                # view_graph_embs = []
+                # for z in z_specifics:
+                #     view_graph_emb = global_mean_pool(z, node2graph)  # [batch_size, dim]
+                #     view_graph_emb = F.normalize(view_graph_emb, p=2, dim=1)
+                #     view_graph_embs.append(view_graph_emb)
+                
+            
+                # view_similarity = (view_graph_embs[0] * view_graph_embs[1]).sum(dim=1).abs().mean()
+                # view_diversity_loss = view_similarity  
+                
+                loss_self,loss_details=encoder.cal_custom_loss(z_specifics,fused_z,learned_specific_adjs
+                                                                ,args.tau,args.h,args.alpha,args.beta,args.gamma)
+                
+                if args.loss_mode == 'ce_only':
+                    loss=loss_sup
+                else:
+                    loss=loss_sup + args.lambda1 * loss_self
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(specific_graph_learner.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(attention_fusion.parameters(), max_norm=5.0)
+                if batch_idx % 50 == 0:
+                    preds = quick_diagnose(logits, batch, model_modules, optimizer, criterion, attention_weights, graph_emb
+                                            )
 
-                    optimizer.step()
+                optimizer.step()
+                
+                
+                total_loss += float(loss.item())
+                total_sup_loss += float(loss_sup.item())
+                total_self_loss += float(loss_self.item())
+                total_lfd_loss += float(loss_details['lfd_loss'].item())
+                total_s_high_loss += float(loss_details['s_high_loss'].item())
+                total_sc_loss += float(loss_details['sc_loss'].item())
+                n_batches += 1
+                
+                with torch.no_grad():
+                    preds = logits.argmax(dim=1)
+                    train_correct += (preds == batch.y.view(-1)).sum().item()
+                    train_total += batch.y.size(0)
+                if batch_idx % 50 == 0:
+                    grad_norms = {}
+                    current_batch_acc = train_correct / train_total if train_total > 0 else 0.0
+                    print(f'Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}, Train Acc so far: {current_batch_acc:.4f}')
                     
-                  
-                    total_loss += float(loss.item())
-                    total_sup_loss += float(loss_sup.item())
-                    total_self_loss += float(loss_self.item())
-                    total_lfd_loss += float(loss_details['lfd_loss'].item())
-                    total_s_high_loss += float(loss_details['s_high_loss'].item())
-                    total_sc_loss += float(loss_details['sc_loss'].item())
-                    n_batches += 1
+                    for name, param in encoder.named_parameters():
+                        if param.grad is not None:
+                            grad_norms[f"encoder_{name}"] = param.grad.norm().item()
                     
-                    with torch.no_grad():
-                        preds = logits.argmax(dim=1)
-                        train_correct += (preds == batch.y.view(-1)).sum().item()
-                        train_total += batch.y.size(0)
-                    if batch_idx % 50 == 0:
-                        grad_norms = {}
-                        current_batch_acc = train_correct / train_total if train_total > 0 else 0.0
-                        print(f'Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}, Train Acc so far: {current_batch_acc:.4f}')
-                        
-                        for name, param in encoder.named_parameters():
-                            if param.grad is not None:
-                                grad_norms[f"encoder_{name}"] = param.grad.norm().item()
-                        
-                        for name, param in classifier.named_parameters():
-                            if param.grad is not None:
-                                grad_norms[f"classifier_{name}"] = param.grad.norm().item()
-                        for name, param in specific_graph_learner.named_parameters():
-                            if param.grad is not None:
-                                grad_norms[f"specific_graph_learner_{name}"] = param.grad.norm().item()
-                        for name, param in attention_fusion.named_parameters():
-                            if param.grad is not None:
-                                grad_norms[f"attention_fusion_{name}"] = param.grad.norm().item()
-                        # 打印主要梯度
-                        print("  Main gradients:")
-                        for key, value in grad_norms.items():
-                            print(f"  {key}: {value:.6f}")
+                    for name, param in classifier.named_parameters():
+                        if param.grad is not None:
+                            grad_norms[f"classifier_{name}"] = param.grad.norm().item()
+                    for name, param in specific_graph_learner.named_parameters():
+                        if param.grad is not None:
+                            grad_norms[f"specific_graph_learner_{name}"] = param.grad.norm().item()
+                    for name, param in attention_fusion.named_parameters():
+                        if param.grad is not None:
+                            grad_norms[f"attention_fusion_{name}"] = param.grad.norm().item()
+                    # 打印主要梯度
+                    print("  Main gradients:")
+                    for key, value in grad_norms.items():
+                        print(f"  {key}: {value:.6f}")
 
 
-                train_acc = train_correct / train_total if train_total > 0 else 0.0
+            train_acc = train_correct / train_total if train_total > 0 else 0.0
+            
+            avg_loss = total_loss / n_batches if n_batches > 0 else 0.0
+            avg_loss = total_loss / n_batches if n_batches > 0 else 0.0
+            avg_sup_loss = total_sup_loss / n_batches if n_batches > 0 else 0.0
+            avg_self_loss = total_self_loss / n_batches if n_batches > 0 else 0.0
+            avg_lfd_loss = total_lfd_loss / n_batches if n_batches > 0 else 0.0
+            avg_s_high_loss = total_s_high_loss / n_batches if n_batches > 0 else 0.0
+            avg_sc_loss = total_sc_loss / n_batches if n_batches > 0 else 0.0
+            
+            trial_writer.add_scalar('Loss/Total', avg_loss, epoch)
+            trial_writer.add_scalar('Loss/Supervised', avg_sup_loss, epoch)
+            trial_writer.add_scalar('Loss/Self_Supervised', avg_self_loss, epoch)
+            trial_writer.add_scalar('Loss/LFD', avg_lfd_loss, epoch)
+            trial_writer.add_scalar('Loss/S_High', avg_s_high_loss, epoch)
+            trial_writer.add_scalar('Loss/SC', avg_sc_loss, epoch)
+            
+            trial_writer.add_scalar('Training/Accuracy', train_acc, epoch)
+            
+            epoch_losses['total'].append(avg_loss)
+            epoch_losses['supervised'].append(avg_sup_loss)
+            epoch_losses['self_supervised'].append(avg_self_loss)
+            epoch_losses['lfd'].append(avg_lfd_loss)
+            epoch_losses['s_high'].append(avg_s_high_loss)
+            epoch_losses['sc'].append(avg_sc_loss)
+            epoch_losses['train_acc'].append(train_acc)  
+            print(f"Trial {trial} Epoch {epoch} - "
+                    f"Total: {avg_loss:.4f}, Sup: {avg_sup_loss:.4f}, Self: {avg_self_loss:.4f}, "
+                    f"LFD: {avg_lfd_loss:.4f}, S_high: {avg_s_high_loss:.4f}, SC: {avg_sc_loss:.4f}")
+            print(f"   Train Accuracy: {train_acc:.4f} ({train_correct}/{train_total})")
+            print(f"  Loss Contribution: CE={avg_sup_loss:.3f}, Self={avg_self_loss*args.lambda1:.3f} "
+                    f"({avg_self_loss:.4f}×{args.lambda1}), Ratio={avg_self_loss*args.lambda1/avg_sup_loss:.2%}")
+            if epoch % args.eval_freq == 0:
+                val_loss,val_metrics = self.test_cls_graphlevel(encoder, classifier, val_loader,specific_graph_learner,attention_fusion,args,trial,'val',log_file=results_log,epoch=epoch)
+                current_f1 = val_metrics['f1_macro']
                 
-                avg_loss = total_loss / n_batches if n_batches > 0 else 0.0
-                avg_loss = total_loss / n_batches if n_batches > 0 else 0.0
-                avg_sup_loss = total_sup_loss / n_batches if n_batches > 0 else 0.0
-                avg_self_loss = total_self_loss / n_batches if n_batches > 0 else 0.0
-                avg_lfd_loss = total_lfd_loss / n_batches if n_batches > 0 else 0.0
-                avg_s_high_loss = total_s_high_loss / n_batches if n_batches > 0 else 0.0
-                avg_sc_loss = total_sc_loss / n_batches if n_batches > 0 else 0.0
-              
-                trial_writer.add_scalar('Loss/Total', avg_loss, epoch)
-                trial_writer.add_scalar('Loss/Supervised', avg_sup_loss, epoch)
-                trial_writer.add_scalar('Loss/Self_Supervised', avg_self_loss, epoch)
-                trial_writer.add_scalar('Loss/LFD', avg_lfd_loss, epoch)
-                trial_writer.add_scalar('Loss/S_High', avg_s_high_loss, epoch)
-                trial_writer.add_scalar('Loss/SC', avg_sc_loss, epoch)
+                if lr_mode == 'plateau':
+                   scheduler.step(current_f1)
                 
-                trial_writer.add_scalar('Training/Accuracy', train_acc, epoch)
+                trial_writer.add_scalar('Validation/Loss', val_loss, epoch)
+                trial_writer.add_scalar('Validation/Accuracy', val_metrics['acc'], epoch)
+                trial_writer.add_scalar('Validation/F1_Macro', val_metrics['f1_macro'], epoch)
+                trial_writer.add_scalar('Validation/F1_Micro', val_metrics['f1_micro'], epoch)
+                trial_writer.add_scalar('Validation/Precision_Macro', val_metrics['precision_macro'], epoch)
+                trial_writer.add_scalar('Validation/Recall_Macro', val_metrics['recall_macro'], epoch)
+                trial_writer.add_scalar('Validation/AUC_Macro', val_metrics['auc_macro'], epoch)
+                trial_writer.add_scalar('Training/LearningRate', optimizer.param_groups[0]['lr'], epoch)
                 
-                epoch_losses['total'].append(avg_loss)
-                epoch_losses['supervised'].append(avg_sup_loss)
-                epoch_losses['self_supervised'].append(avg_self_loss)
-                epoch_losses['lfd'].append(avg_lfd_loss)
-                epoch_losses['s_high'].append(avg_s_high_loss)
-                epoch_losses['sc'].append(avg_sc_loss)
-                epoch_losses['train_acc'].append(train_acc)  
-                print(f"Trial {trial} Epoch {epoch} - "
-                      f"Total: {avg_loss:.4f}, Sup: {avg_sup_loss:.4f}, Self: {avg_self_loss:.4f}, "
-                      f"LFD: {avg_lfd_loss:.4f}, S_high: {avg_s_high_loss:.4f}, SC: {avg_sc_loss:.4f}")
-                print(f"   Train Accuracy: {train_acc:.4f} ({train_correct}/{train_total})")
-                print(f"  Loss Contribution: CE={avg_sup_loss:.3f}, Self={avg_self_loss*args.lambda1:.3f} "
-                      f"({avg_self_loss:.4f}×{args.lambda1}), Ratio={avg_self_loss*args.lambda1/avg_sup_loss:.2%}")
-                if epoch % args.eval_freq == 0:
-                    val_loss,val_metrics = self.test_cls_graphlevel(encoder, classifier, val_loader,specific_graph_learner,attention_fusion,args,trial,'val',log_file=results_log,epoch=epoch)
-                    current_f1 = val_metrics['f1_macro']
-                    
-                    scheduler.step(current_f1)
-                    
-                    trial_writer.add_scalar('Validation/Loss', val_loss, epoch)
-                    trial_writer.add_scalar('Validation/Accuracy', val_metrics['acc'], epoch)
-                    trial_writer.add_scalar('Validation/F1_Macro', val_metrics['f1_macro'], epoch)
-                    trial_writer.add_scalar('Validation/F1_Micro', val_metrics['f1_micro'], epoch)
-                    trial_writer.add_scalar('Validation/Precision_Macro', val_metrics['precision_macro'], epoch)
-                    trial_writer.add_scalar('Validation/Recall_Macro', val_metrics['recall_macro'], epoch)
-                    trial_writer.add_scalar('Validation/AUC_Macro', val_metrics['auc_macro'], epoch)
-                    trial_writer.add_scalar('Training/LearningRate', optimizer.param_groups[0]['lr'], epoch)
-                    
-                    
-                    trial_writer.add_scalars('Accuracy_Comparison', {
-                        'Train': train_acc,
-                        'Validation': val_metrics['acc']
-                    }, epoch)
-                    
-                    
-                    per_class_f1 = val_metrics.get('per_class_f1', [0]*5)
-                    print(f"  Val Accuracy: {val_metrics['acc']:.4f} | Train-Val Gap: {train_acc - val_metrics['acc']:.4f}")
-                    print(f"  Per-class F1: {[f'{f:.2f}' for f in per_class_f1]}")
-                   
-                    if max(per_class_f1) - min(per_class_f1) > 0.5:
-                        print(f"   WARNING: Severe class imbalance detected! Max F1={max(per_class_f1):.2f}, Min F1={min(per_class_f1):.2f}")
-                    
-                    if current_f1> best_val:
-                        best_val = current_f1
-                        best_val_metrics=val_metrics
-                        best_state = {
-                            'encoder': copy.deepcopy(encoder.state_dict()),
-                            'classifier': copy.deepcopy(classifier.state_dict()),
-                            'specific': copy.deepcopy(specific_graph_learner.state_dict()),
-                            'attention_fusion': copy.deepcopy(attention_fusion.state_dict()),
-                            'optimizer': copy.deepcopy(optimizer.state_dict())
-                        }
-                        patience_counter = 0 
-                        print(f"  New best F1: {best_val:.4f} (saved model)")
-                    else:
-                        patience_counter += 1
-                        print(f"   No improvement for {patience_counter} eval periods (patience: {early_stop_patience})")
-                        if patience_counter >= early_stop_patience:
-                            print(f"   Early stopping triggered! Best F1: {best_val:.4f}")
-                            break 
-            if best_val_metrics is not None:
-                val_results.append({
-                    'trial': trial,
-                    'acc': best_val_metrics['acc'],
-                    'metrics': best_val_metrics
-                })
-            self.plot_loss_curves(epoch_losses, trial, trial_writer)
-            trial_writer.close()
-            if best_state is not None:
-                encoder.load_state_dict(best_state['encoder'])
-                classifier.load_state_dict(best_state['classifier'])
-                specific_graph_learner.load_state_dict(best_state['specific'])
-                attention_fusion.load_state_dict(best_state['attention_fusion'])
-                print(f"Restored best model with F1_macro: {best_val:.4f} for testing")
-            test_loss, test_metrics = self.test_cls_graphlevel(encoder, classifier, test_loader,specific_graph_learner,attention_fusion,args,trial,'test',log_file=results_log,epoch=None)
-            test_results.append({
+                
+                trial_writer.add_scalars('Accuracy_Comparison', {
+                    'Train': train_acc,
+                    'Validation': val_metrics['acc']
+                }, epoch)
+                
+                
+                per_class_f1 = val_metrics.get('per_class_f1', [0]*5)
+                print(f"  Val Accuracy: {val_metrics['acc']:.4f} | Train-Val Gap: {train_acc - val_metrics['acc']:.4f}")
+                print(f"  Per-class F1: {[f'{f:.2f}' for f in per_class_f1]}")
+                
+                if max(per_class_f1) - min(per_class_f1) > 0.5:
+                    print(f"   WARNING: Severe class imbalance detected! Max F1={max(per_class_f1):.2f}, Min F1={min(per_class_f1):.2f}")
+                
+                if current_f1> best_val:
+                    best_val = current_f1
+                    best_val_metrics=val_metrics
+                    best_state = {
+                        'encoder': copy.deepcopy(encoder.state_dict()),
+                        'classifier': copy.deepcopy(classifier.state_dict()),
+                        'specific': copy.deepcopy(specific_graph_learner.state_dict()),
+                        'attention_fusion': copy.deepcopy(attention_fusion.state_dict()),
+                        'optimizer': copy.deepcopy(optimizer.state_dict())
+                    }
+                    patience_counter = 0 
+                    print(f"  New best F1: {best_val:.4f} (saved model)")
+                else:
+                    patience_counter += 1
+                    print(f"  No improvement (current F1: {current_f1:.4f}, best F1: {best_val:.4f})") 
+
+        if best_val_metrics is not None:
+            val_results.append({
                 'trial': trial,
-                'acc': test_metrics['acc'],
-                'metrics': test_metrics
+                'acc': best_val_metrics['acc'],
+                'metrics': best_val_metrics
             })
+            if lr_mode == 'cosine':
+                scheduler.step()
+        self.plot_loss_curves(epoch_losses, trial, trial_writer)
+        trial_writer.close()
+        if best_state is not None:
+            encoder.load_state_dict(best_state['encoder'])
+            classifier.load_state_dict(best_state['classifier'])
+            specific_graph_learner.load_state_dict(best_state['specific'])
+            attention_fusion.load_state_dict(best_state['attention_fusion'])
+            print(f"Restored best model with F1_macro: {best_val:.4f} for testing")
+        test_loss, test_metrics = self.test_cls_graphlevel(encoder, classifier, test_loader,specific_graph_learner,attention_fusion,args,trial,'test',log_file=results_log,epoch=None)
+        test_results.append({
+            'trial': trial,
+            'acc': test_metrics['acc'],
+            'metrics': test_metrics
+        })
         if args.downstream_task == 'classification' and len(test_results) > 0:
            
             results_log.write("\n\n")
